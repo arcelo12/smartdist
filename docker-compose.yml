@@ -1,0 +1,16 @@
+services:
+  dnsdist:
+    image: powerdns/dnsdist-20:latest
+    container_name: dnsdist
+    restart: unless-stopped
+    ports:
+      - "192.168.108.6:53:5300/udp"
+      - "192.168.108.6:53:5300/tcp"
+      - "8083:8083/tcp"
+    volumes:
+      # Memasukkan file konfigurasi utama
+      - ./dnsdist.conf:/etc/dnsdist/dnsdist.conf:ro
+      # Memasukkan plugin wrapper
+      - ./smartdns_plugin.lua:/etc/dnsdist/smartdns_plugin.lua:ro
+      # Memasukkan folder list dari direktori lokal ./cdn-ips agar ikut di dalam folder proyek dnsdist
+      - ./cdn-ips:/etc/smartdns/cdn-ips:ro

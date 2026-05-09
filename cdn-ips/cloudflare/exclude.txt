@@ -1,0 +1,14 @@
+region1.v2.argotunnel.com
+region2.v2.argotunnel.com
+cftunnel.com
+h2.cftunnel.com
+quic.cftunnel.com
+api.cloudflare.com
+update.argotunnel.com
+cloudflareaccess.com
+pqtunnels.cloudflareresearch.com
+acme-v02.api.letsencrypt.org
+engage.cloudflareclient.com
+imap.hostinger.com
+smtp.hostinger.com
+*.riotgames.com

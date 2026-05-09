@@ -1,0 +1,22 @@
+# Binary
+cf-checker-bin
+cf-checker/cf-checker-bin
+*.exe
+
+# Go
+cf-checker/go.sum
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Test files
+cf-test-domains.txt
