@@ -2,20 +2,15 @@
 cf-checker/cf-checker-bin
 *.exe
 docker-compose.yml
-# Go
 cf-checker/go.sum
 plan.md
-# OS
 .DS_Store
 Thumbs.db
 desktop.ini
 cf-node-test.sh
-# Editor
 .vscode/
 .idea/
 *.swp
 *.swo
 *~
-
-# Test files
 cf-test-domains.txt
