@@ -7,7 +7,7 @@ plan.md
 dnsdist.conf
 .DS_Store
 Thumbs.db
-desktop.ini
+dnsdist.conf
 cf-node-test.sh
 .vscode/
 .idea/
