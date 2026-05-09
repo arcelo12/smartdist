@@ -4,12 +4,12 @@ cf-checker/cf-checker-bin
 docker-compose.yml
 # Go
 cf-checker/go.sum
-
+plan.md
 # OS
 .DS_Store
 Thumbs.db
 desktop.ini
-
+cf-node-test.sh
 # Editor
 .vscode/
 .idea/
