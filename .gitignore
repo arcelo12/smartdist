@@ -4,6 +4,7 @@ cf-checker/cf-checker-bin
 docker-compose.yml
 cf-checker/go.sum
 plan.md
+dnsdist.conf
 .DS_Store
 Thumbs.db
 desktop.ini
