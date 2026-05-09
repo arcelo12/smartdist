@@ -1,8 +1,7 @@
-# Binary
-cf-checker-bin
+
 cf-checker/cf-checker-bin
 *.exe
-
+docker-compose.yml
 # Go
 cf-checker/go.sum
 
