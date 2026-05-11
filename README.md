@@ -40,39 +40,21 @@ SmartDist/
 SmartDist replicates the highly coveted **Parallel Upstream Aggregation & Fastest IP** mode directly inside DnsDist without external dependencies.
 
 ```mermaid
-flowchart TD
-    classDef client fill:#3498db,stroke:#2980b9,stroke-width:2px,color:#fff,rx:50px,ry:50px;
-    classDef core fill:#2ecc71,stroke:#27ae60,stroke-width:2px,color:#fff,rx:5px,ry:5px;
-    classDef upstream fill:#e67e22,stroke:#d35400,stroke-width:2px,color:#fff;
-    classDef logic fill:#9b59b6,stroke:#8e44ad,stroke-width:2px,color:#fff;
-    classDef cache fill:#f1c40f,stroke:#f39c12,stroke-width:2px,color:#333;
+sequenceDiagram
+    participant Client
+    participant SmartDist
+    participant Upstreams
 
-    Client(("💻 Client")):::client
+    Client->>SmartDist: 1. DNS Query (e.g. x.com)
     
-    subgraph DnsDist ["DnsDist + SmartDNS Lua Plugin"]
-        direction TB
-        Main["🛡️ DnsDist Engine"]:::core
-        Aggregator["🔄 Parallel Aggregator"]:::logic
-        Prober["⚡ Async TCP Prober"]:::logic
-        Cache[("💾 Speed Cache")]:::cache
-        Rewriter["✏️ Packet Rewriter (fastest-ip)"]:::core
-        
-        Main -- "Intercepts Query" --> Rewriter
-        Main -. "Background Trigger" .-> Aggregator
-        Aggregator -- "Aggregates IPs" --> Prober
-        Prober -- "Saves Winner" --> Cache
-        Cache -- "Feeds Best IP" --> Rewriter
+    rect rgb(240, 248, 255)
+    Note over SmartDist,Upstreams: ⚡ Async Background Process (No Delay for Client)
+    SmartDist--)Upstreams: 2. Parallel Query to 8.8.8.8, 1.1.1.1, etc.
+    Upstreams--)SmartDist: 3. Aggregates all returned IPs
+    SmartDist->>SmartDist: 4. TCP Ping to find the absolute fastest IP!
     end
-    
-    Up1["🌐 Upstream 1 (8.8.8.8)"]:::upstream
-    Up2["🌐 Upstream 2 (1.1.1.1)"]:::upstream
-    Up3["🌐 Upstream N..."]:::upstream
 
-    Client == "1️⃣ DNS Request" ==> Main
-    Aggregator -. "2️⃣ Async UDP" .-> Up1 & Up2 & Up3
-    Up1 & Up2 & Up3 -. "3️⃣ Return All IPs" .-> Aggregator
-    
-    Rewriter == "4️⃣ DNS Response (Fastest IP on Top)" ==> Client
+    SmartDist->>Client: 5. Response returned (Fastest IP moved to the top!)
 ```
 
 1. **Parallel Querying**: DnsDist sends background queries to ALL upstreams simultaneously.
