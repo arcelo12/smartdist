@@ -24,12 +24,12 @@ local _probe_queue = {}
 local _active_sockets = {}
 
 -- Konfigurasi Speed Check (dapat di-override di dnsdist.conf sebelum dofile())
--- Default values digunakan jika tidak diset
 SPEEDCHECK_ENABLED     = true       -- Aktifkan/nonaktifkan fitur ini
-SPEEDCHECK_MODE        = "fastest-ip" -- "fastest-ip" (reorder) atau "fastest-response" (all-fastest)
+SPEEDCHECK_MODE        = "fastest-ip" -- "fastest-ip" (reorder) atau "fastest-response" (overwrite)
 SPEEDCHECK_TIMEOUT_MS  = 200        -- Timeout TCP connect (milidetik)
 SPEEDCHECK_PORTS       = {80, 443}  -- Port yang diuji
 SPEEDCHECK_MAX_IPS     = 6          -- Maks IP yang dites per domain
+SPEEDCHECK_MAX_RESPONSE= 2          -- Maksimal jumlah IP Juara yang dikembalikan (digunakan oleh fastest-response)
 SPEEDCHECK_CACHE_TTL   = 300        -- Detik menyimpan hasil di memori
 SPEEDCHECK_QUEUE_LIMIT = 200        -- Maks antrian domain sekaligus
 
@@ -68,7 +68,7 @@ end
 local function _get_fastest(domain)
     local entry = _speed_cache[domain]
     if entry and _now() < entry.expires_at then
-        return entry.ip
+        return entry.ips
     end
     _speed_cache[domain] = nil
     return nil
@@ -108,15 +108,23 @@ function maintenance()
             local res, err = sess.sock:connect(sess.ip, sess.port)
             -- luasocket mengembalikan 1 saat koneksi non-blocking berhasil
             if res == 1 or (not err) or err == "already connected" then
-                -- MENANG! IP ini adalah yang tercepat untuk domain ini
+                -- MENANG! IP ini cepat! Masukkan ke array IP pemenang.
                 local latency_ms = math.floor((now - sess.start_time) * 1000)
-                if not _speed_cache[sess.domain] then
-                    _speed_cache[sess.domain] = {
-                        ip = sess.ip,
-                        expires_at = now + SPEEDCHECK_CACHE_TTL
-                    }
-                    infolog(string.format("[SmartDist] Fastest: %s -> %s (%dms)",
-                        sess.domain, sess.ip, latency_ms))
+                local entry = _speed_cache[sess.domain]
+                if not entry then
+                    entry = { ips = {}, expires_at = now + SPEEDCHECK_CACHE_TTL }
+                    _speed_cache[sess.domain] = entry
+                end
+                
+                local is_dup = false
+                for _, existing_ip in ipairs(entry.ips) do
+                    if existing_ip == sess.ip then is_dup = true break end
+                end
+                
+                if not is_dup and #entry.ips < (SPEEDCHECK_MAX_RESPONSE or 2) then
+                    table.insert(entry.ips, sess.ip)
+                    infolog(string.format("[SmartDist] Fastest Rank #%d for %s -> %s (%dms)",
+                        #entry.ips, sess.domain, sess.ip, latency_ms))
                 end
                 pcall(function() sess.sock:close() end)
             else
@@ -502,34 +510,40 @@ function smartdns_enable_speedcheck()
         -- Jika hanya 1 IP, tidak perlu speedcheck
         if #ips < 2 then return DNSResponseAction.None, "" end
 
-        local fastest = _get_fastest(domain)
-        if fastest then
-            -- Ada cached fastest IP: overwrite semua record dengan IP terbaik
+        local fastest_ips = _get_fastest(domain)
+        if fastest_ips and #fastest_ips > 0 then
+            -- Ada cached fastest IPs: rewrite DNS packet
             local pkt_bytes = {pkt:byte(1, #pkt)}
-            local target_bytes = {}
-            if dr.qtype == DNSQType.AAAA then
-                target_bytes = _ipv6_to_bytes(fastest)
-            else
-                for octet in fastest:gmatch("%d+") do
-                    target_bytes[#target_bytes + 1] = tonumber(octet)
+            
+            -- Convert IPs ke array of byte arrays
+            local target_bytes_list = {}
+            for _, fip in ipairs(fastest_ips) do
+                local tbytes = {}
+                if dr.qtype == DNSQType.AAAA then
+                    tbytes = _ipv6_to_bytes(fip)
+                else
+                    for octet in fip:gmatch("%d+") do
+                        tbytes[#tbytes + 1] = tonumber(octet)
+                    end
                 end
+                table.insert(target_bytes_list, tbytes)
             end
 
             if SPEEDCHECK_MODE == "fastest-ip" then
-                -- Mode fastest-ip: Reorder (Tukar IP tercepat ke urutan paling atas)
-                -- Cari record pertama dan record yang berisi IP tercepat
+                -- Mode fastest-ip: Reorder (Tukar IP tercepat #1 ke urutan paling atas)
                 local first_rec_offset = nil
                 local fastest_rec_offset = nil
+                local top_target = target_bytes_list[1]
                 
                 for i = 0, record_count - 1 do
                     local rec = overlay:getRecord(i)
                     if rec.type == dr.qtype and rec.contentLength == record_len then
                         if not first_rec_offset then first_rec_offset = rec.contentOffset end
                         
-                        -- Cek apakah record ini adalah IP tercepat kita
+                        -- Cek apakah record ini adalah IP tercepat #1 kita
                         local is_match = true
                         for b = 1, record_len do
-                            if pkt_bytes[rec.contentOffset + b] ~= target_bytes[b] then
+                            if pkt_bytes[rec.contentOffset + b] ~= top_target[b] then
                                 is_match = false break
                             end
                         end
@@ -546,13 +560,18 @@ function smartdns_enable_speedcheck()
                     end
                 end
             else
-                -- Mode fastest-response: Overwrite SEMUA record dengan IP tercepat
+                -- Mode fastest-response: Overwrite semua record dengan IP terbaik secara Round-Robin
+                local fip_index = 1
                 for i = 0, record_count - 1 do
                     local rec = overlay:getRecord(i)
                     if rec.type == dr.qtype and rec.contentLength == record_len then
+                        local current_target = target_bytes_list[fip_index]
                         for b = 1, record_len do
-                            pkt_bytes[rec.contentOffset + b] = target_bytes[b]
+                            pkt_bytes[rec.contentOffset + b] = current_target[b]
                         end
+                        -- Round robin ke IP juara berikutnya
+                        fip_index = fip_index + 1
+                        if fip_index > #target_bytes_list then fip_index = 1 end
                     end
                 end
             end

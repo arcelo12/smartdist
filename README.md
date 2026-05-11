@@ -106,6 +106,7 @@ SPEEDCHECK_MODE        = "fastest-ip" -- "fastest-ip" atau "fastest-response"
 SPEEDCHECK_TIMEOUT_MS  = 200        -- Timeout TCP connect (ms)
 SPEEDCHECK_PORTS       = {80, 443}  -- Port yang diuji
 SPEEDCHECK_MAX_IPS     = 6          -- Maks IP yang dites per domain
+SPEEDCHECK_MAX_RESPONSE= 2          -- Maks IP yang dikembalikan oleh fastest-response
 SPEEDCHECK_CACHE_TTL   = 300        -- Detik cache hasil tercepat
 SPEEDCHECK_QUEUE_LIMIT = 200        -- Maks antrian background
 
@@ -136,8 +137,8 @@ SmartDist replicates SmartDNS's `speed-check-mode ping,tcp:80,tcp:443` behavior:
 
 1. **First query** for `x.com` → DnsDist returns the initial response from the default upstream normally to prevent stalling. Background: Parallel UDP queries are sent to all `newServer` upstreams.
 2. **Background worker** (`maintenance()`, runs every ~1s) aggregates all returned IPs and opens non-blocking TCP connections to all of them simultaneously.
-3. **First to respond** wins → its IP is cached as "fastest" for `SPEEDCHECK_CACHE_TTL` seconds.
-4. **Next query** for `x.com` → DnsDist intercepts the response and reorders it (`fastest-ip` mode) so the winning IP is at the top.
+3. **First connections** win → the fastest IP(s) are cached as winners for `SPEEDCHECK_CACHE_TTL` seconds.
+4. **Next query** for `x.com` → DnsDist intercepts the response and rewrites it. In `fastest-ip` mode, it reorders the packet to put the absolute fastest IP at the top. In `fastest-response` mode, it overwrites the packet to return only the top N fastest IPs (based on `SPEEDCHECK_MAX_RESPONSE`).
 
 ## 🔌 Plugin API Reference
 
@@ -194,10 +195,11 @@ smartdns_enable_speedcheck()
 | Variable | Default | Description |
 |---|---|---|
 | `SPEEDCHECK_ENABLED` | `true` | Master on/off switch |
-| `SPEEDCHECK_MODE` | `"fastest-ip"` | `"fastest-ip"` (reorder) or `"fastest-response"` (single IP overwrite) |
+| `SPEEDCHECK_MODE` | `"fastest-ip"` | `"fastest-ip"` (reorder) or `"fastest-response"` (top N IPs overwrite) |
 | `SPEEDCHECK_TIMEOUT_MS` | `200` | TCP connect timeout (ms) |
 | `SPEEDCHECK_PORTS` | `{80, 443}` | Ports to test |
 | `SPEEDCHECK_MAX_IPS` | `6` | Max IPs tested per domain |
+| `SPEEDCHECK_MAX_RESPONSE`| `2` | Max winning IPs to return (for fastest-response) |
 | `SPEEDCHECK_CACHE_TTL` | `300` | Seconds to cache result |
 | `SPEEDCHECK_QUEUE_LIMIT` | `200` | Max concurrent probe queue size |
 

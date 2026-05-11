@@ -105,6 +105,7 @@ SPEEDCHECK_MODE        = "fastest-ip" -- "fastest-ip" atau "fastest-response"
 SPEEDCHECK_TIMEOUT_MS  = 200        -- Timeout TCP connect (ms)
 SPEEDCHECK_PORTS       = {80, 443}  -- Port yang diuji
 SPEEDCHECK_MAX_IPS     = 6          -- Maksimal IP yang dites per domain
+SPEEDCHECK_MAX_RESPONSE= 2          -- Maksimal jumlah IP yang dikembalikan oleh fastest-response
 SPEEDCHECK_CACHE_TTL   = 300        -- Berapa detik menyimpan IP tercepat di memori
 SPEEDCHECK_QUEUE_LIMIT = 200        -- Maksimal antrian di latar belakang
 
@@ -135,8 +136,8 @@ SmartDist mereplikasi fungsionalitas `speed-check-mode ping,tcp:80,tcp:443` dari
 
 1. **Query Pertama** untuk `x.com` → DnsDist mengembalikan respons awal dari upstream default agar koneksi tidak tertahan. Di *background*: UDP query paralel dikirimkan ke semua `newServer` Anda.
 2. **Background Worker** (`maintenance()`, berjalan tiap ~1 detik) mengagregasi semua IP balasan dan membuka koneksi TCP *non-blocking* ke seluruh IP tersebut secara bersamaan.
-3. **Respon Pertama** menang → IP-nya dicache sebagai "tercepat" selama `SPEEDCHECK_CACHE_TTL` detik.
-4. **Query Berikutnya** untuk `x.com` → DnsDist mencegat respons dan mengurutkannya ulang (mode `fastest-ip`) sehingga IP pemenang berada di urutan teratas.
+3. **Respon Pertama** menang → Beberapa IP yang paling pertama merespons dicache sebagai "juara" selama `SPEEDCHECK_CACHE_TTL` detik.
+4. **Query Berikutnya** untuk `x.com` → DnsDist mencegat respons dan mengubahnya. Pada mode `fastest-ip`, ia menukar urutan paket agar IP tercepat nomor #1 berada di urutan teratas. Pada mode `fastest-response`, ia akan menimpa balasan DNS agar hanya menampilkan beberapa IP terbaik (sesuai batasan `SPEEDCHECK_MAX_RESPONSE`).
 
 ## 🔌 Referensi API Plugin
 
@@ -195,10 +196,11 @@ Dapat diatur di `dnsdist.conf` (sebelum memanggil `smartdns_enable_speedcheck()`
 | Variabel | Default | Deskripsi |
 |---|---|---|
 | `SPEEDCHECK_ENABLED` | `true` | Tombol utama nyala/mati |
-| `SPEEDCHECK_MODE` | `"fastest-ip"` | `"fastest-ip"` (*reorder*) atau `"fastest-response"` (*single IP overwrite*) |
+| `SPEEDCHECK_MODE` | `"fastest-ip"` | `"fastest-ip"` (*reorder*) atau `"fastest-response"` (*overwrite top N IP*) |
 | `SPEEDCHECK_TIMEOUT_MS` | `200` | Batas timeout TCP connect (milidetik) |
 | `SPEEDCHECK_PORTS` | `{80, 443}` | Port TCP yang akan diping |
 | `SPEEDCHECK_MAX_IPS` | `6` | Batas maksimal IP yang dites per domain |
+| `SPEEDCHECK_MAX_RESPONSE`| `2` | Batas IP Juara yang dikembalikan oleh fastest-response |
 | `SPEEDCHECK_CACHE_TTL` | `300` | Lama detik menyimpan hasil di memori |
 | `SPEEDCHECK_QUEUE_LIMIT` | `200` | Kapasitas maksimal antrian *background probing* |
 
