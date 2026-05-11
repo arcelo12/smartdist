@@ -20,6 +20,7 @@ local _has_socket, _socket = pcall(require, "socket")
 local _speed_cache = {}
 -- Antrian probing: { { domain, ips[], timestamp } }
 local _probe_queue = {}
+local _probe_queue_set = {} -- O(1) lookup
 -- Sesi socket aktif (non-blocking): { { sock, ip, domain, start_time } }
 local _active_sockets = {}
 
@@ -32,11 +33,24 @@ SPEEDCHECK_MAX_IPS     = 6          -- Maks IP yang dites per domain
 SPEEDCHECK_MAX_RESPONSE= 2          -- Maksimal jumlah IP Juara yang dikembalikan (digunakan oleh fastest-response)
 SPEEDCHECK_CACHE_TTL   = 300        -- Detik menyimpan hasil di memori
 SPEEDCHECK_QUEUE_LIMIT = 200        -- Maks antrian domain sekaligus
+SPEEDCHECK_MAX_SOCKETS = 120        -- BUG FIX #3: Batas maksimal socket TCP aktif (6 IP x 2 port x 10 domain)
 
 -- Konfigurasi Parallel Upstream Aggregation
-PARALLEL_UPSTREAMS     = {}         -- Array IP upstream, contoh: {"8.8.8.8", "1.1.1.1"}
-local _parallel_queue = {}          -- Antrian domain yang perlu diresolve paralel
-local _parallel_sockets = {}        -- Socket UDP aktif untuk query DNS
+-- Secara default SmartDist menggunakan newServer() yang sudah dikonfigurasi,
+-- tetapi HANYA memilih server yang CEPAT (latency di bawah threshold).
+-- Jika ingin menentukan upstream secara manual, isi array ini:
+--   PARALLEL_UPSTREAMS = {"8.8.8.8", "1.1.1.1"}
+-- Jika kosong, akan auto-detect dari newServer() dengan filter latency.
+PARALLEL_UPSTREAMS             = {}    -- Kosong = auto dari newServer()
+PARALLEL_UPSTREAM_MAX_LATENCY  = 300   -- Skip upstream jika latency > ms ini
+PARALLEL_UPSTREAM_REFRESH_SEC  = 30    -- Seberapa sering rebuild list upstream (detik)
+PARALLEL_MAX_UPSTREAMS         = 5     -- Maks jumlah upstream yang dipakai sekaligus
+SPEEDCHECK_MAX_PAR_SOCKETS    = 30    -- Batas socket UDP parallel
+local _parallel_queue      = {}        -- Antrian domain yang perlu diresolve paralel
+local _parallel_queue_set  = {}        -- Hash map O(1) untuk duplikat
+local _parallel_sockets    = {}        -- Socket UDP aktif untuk query DNS
+local _active_upstreams    = {}        -- List upstream aktif setelah filter latency
+local _last_upstream_refresh = 0       -- Timestamp refresh terakhir
 
 if not _has_socket then
     warnlog("[SmartDist] lua-socket tidak ditemukan! Speed Check DINONAKTIFKAN.")
@@ -78,16 +92,18 @@ end
 local function _enqueue(domain, ips)
     if not SPEEDCHECK_ENABLED then return end
     if #_probe_queue >= SPEEDCHECK_QUEUE_LIMIT then return end
-    -- Cek duplikat
-    for _, item in ipairs(_probe_queue) do
-        if item.domain == domain then return end
-    end
+    
+    -- Cek duplikat O(1)
+    if _probe_queue_set[domain] then return end
+
     -- Batasi jumlah IP
     local limited = {}
     for i = 1, math.min(#ips, SPEEDCHECK_MAX_IPS) do
         limited[i] = ips[i]
     end
+    
     table.insert(_probe_queue, { domain = domain, ips = limited })
+    _probe_queue_set[domain] = true
 end
 
 -- Fungsi maintenance() dijalankan DnsDist setiap ~1 detik
@@ -97,6 +113,49 @@ function maintenance()
 
     local timeout_sec = SPEEDCHECK_TIMEOUT_MS / 1000
     local now = _now()
+
+    -- [0] SMART UPSTREAM REFRESH: Rebuild list upstream dari newServer() secara berkala.
+    -- Hanya upstream yang UP dan latency-nya di bawah threshold yang dipilih.
+    if (now - _last_upstream_refresh) >= (PARALLEL_UPSTREAM_REFRESH_SEC or 30) then
+        _last_upstream_refresh = now
+        local max_lat = PARALLEL_UPSTREAM_MAX_LATENCY or 300
+        local max_up  = PARALLEL_MAX_UPSTREAMS or 5
+
+        -- Jika user sudah set manual, pakai itu
+        if PARALLEL_UPSTREAMS and #PARALLEL_UPSTREAMS > 0 then
+            _active_upstreams = PARALLEL_UPSTREAMS
+        else
+            -- Auto dari newServer(): ambil semua yang UP, sort by latency, ambil top N
+            local candidates = {}
+            local ok, srvs = pcall(getServers)
+            if ok and srvs then
+                for _, s in ipairs(srvs) do
+                    local lat = s:getLatency()
+                    local up  = s:isUp()
+                    if up and lat > 0 and lat <= max_lat then
+                        local name = s:getName()
+                        -- Ekstrak IP saja (hilangkan port :53)
+                        local ip = name:match("^%[?([^%]%[]+)%]?:%d+$") or name:match("^([^:]+)")
+                        if ip then
+                            table.insert(candidates, { ip = ip, lat = lat })
+                        end
+                    end
+                end
+            end
+            -- Sort ascending by latency
+            table.sort(candidates, function(a, b) return a.lat < b.lat end)
+            -- Ambil hanya top N
+            _active_upstreams = {}
+            for i = 1, math.min(#candidates, max_up) do
+                table.insert(_active_upstreams, candidates[i].ip)
+            end
+            if #_active_upstreams > 0 then
+                local names = table.concat(_active_upstreams, ", ")
+                infolog(string.format("[SmartDist] Parallel: %d upstream aktif (lat <=%.0fms): %s",
+                    #_active_upstreams, max_lat, names))
+            end
+        end
+    end
 
     -- [1] Periksa socket aktif: siapa yang sudah konek?
     local still_active = {}
@@ -135,85 +194,96 @@ function maintenance()
     end
     _active_sockets = still_active
 
-    -- [2] Ambil item dari antrian, buka socket non-blocking baru
-    if #_probe_queue > 0 then
-        local item = table.remove(_probe_queue, 1)
-        for _, ip in ipairs(item.ips) do
-            for _, port in ipairs(SPEEDCHECK_PORTS) do
-                local ok, sock = pcall(function()
-                    local s = _socket.tcp()
-                    s:settimeout(0)  -- NON-BLOCKING
-                    s:connect(ip, port)
-                    return s
-                end)
-                if ok and sock then
-                    table.insert(_active_sockets, {
-                        sock = sock,
-                        ip = ip,
-                        port = port,
-                        domain = item.domain,
-                        start_time = now
-                    })
+    -- [2] DRAIN BATCH: Ambil item dari antrian, buka socket jika masih ada slot
+    -- BUG FIX #3: Jangan buka socket baru jika sudah melebihi batas
+    if #_active_sockets < (SPEEDCHECK_MAX_SOCKETS or 120) then
+        local drain_count = math.min(5, #_probe_queue)
+        for i = 1, drain_count do
+            local item = table.remove(_probe_queue, 1)
+            if item then
+                for _, ip in ipairs(item.ips) do
+                    for _, port in ipairs(SPEEDCHECK_PORTS) do
+                        local ok, sock = pcall(function()
+                            local s = _socket.tcp()
+                            s:settimeout(0)
+                            s:connect(ip, port)
+                            return s
+                        end)
+                        if ok and sock then
+                            table.insert(_active_sockets, {
+                                sock = sock,
+                                ip = ip,
+                                port = port,
+                                domain = item.domain,
+                                start_time = now
+                            })
+                        end
+                    end
                 end
+                -- BUG FIX #2: Hapus dari set SETELAH semua socket domain ini dibuka
+                _probe_queue_set[item.domain] = nil
             end
         end
     end
 
     -- [3] PARALLEL UPSTREAM AGGREGATION: Cek response UDP DNS
-    local still_parallel = {}
-    for _, sess in ipairs(_parallel_sockets) do
-        if (now - sess.start_time) > 1 then -- 1 sec timeout for DNS
-            pcall(function() sess.sock:close() end)
-        else
-            local data, err = sess.sock:receive()
-            if data then
-                -- Parse DNS Response secara manual menggunakan DnsDist Overlay
-                pcall(function()
-                    local overlay = newDNSPacketOverlay(data)
-                    local count = overlay:getRecordsCountInSection(DNSSection.Answer)
-                    local ips = {}
-                    for i = 0, count - 1 do
-                        local rec = overlay:getRecord(i)
-                        if rec.type == DNSQType.A and rec.contentLength == 4 then
-                            local ip_str = string.format("%d.%d.%d.%d",
-                                data:byte(rec.contentOffset + 1), data:byte(rec.contentOffset + 2),
-                                data:byte(rec.contentOffset + 3), data:byte(rec.contentOffset + 4))
-                            ips[#ips + 1] = ip_str
-                        end
-                    end
-                    if #ips > 0 then
-                        -- Gabungkan IP dari upstream ini ke dalam antrian speedcheck!
-                        _enqueue(sess.domain, ips)
-                        infolog(string.format("[SmartDist] Parallel Upstream %s returned %d IPs for %s", sess.upstream, #ips, sess.domain))
-                    end
-                end)
+    -- Hanya berjalan jika ada upstream aktif (setelah filter latency)
+    if #_active_upstreams > 0 then
+        local still_parallel = {}
+        for _, sess in ipairs(_parallel_sockets) do
+            if (now - sess.start_time) > 1 then
                 pcall(function() sess.sock:close() end)
             else
-                still_parallel[#still_parallel + 1] = sess
+                local data, err = sess.sock:receive()
+                if data then
+                    pcall(function()
+                        local overlay = newDNSPacketOverlay(data)
+                        local count = overlay:getRecordsCountInSection(DNSSection.Answer)
+                        local ips = {}
+                        for i = 0, count - 1 do
+                            local rec = overlay:getRecord(i)
+                            if rec.type == DNSQType.A and rec.contentLength == 4 then
+                                local ip_str = string.format("%d.%d.%d.%d",
+                                    data:byte(rec.contentOffset + 1), data:byte(rec.contentOffset + 2),
+                                    data:byte(rec.contentOffset + 3), data:byte(rec.contentOffset + 4))
+                                ips[#ips + 1] = ip_str
+                            end
+                        end
+                        if #ips > 0 then
+                            _enqueue(sess.domain, ips)
+                        end
+                    end)
+                    pcall(function() sess.sock:close() end)
+                else
+                    still_parallel[#still_parallel + 1] = sess
+                end
             end
         end
-    end
-    _parallel_sockets = still_parallel
+        _parallel_sockets = still_parallel
 
-    -- [4] PARALLEL UPSTREAM AGGREGATION: Kirim UDP Query
-    if #_parallel_queue > 0 then
-        local domain = table.remove(_parallel_queue, 1)
-        local query_pkt, id = _build_dns_a_query(domain)
-        for _, upstream in ipairs(PARALLEL_UPSTREAMS) do
-            local ok, sock = pcall(function()
-                local s = _socket.udp()
-                s:settimeout(0)
-                s:setpeername(upstream, 53)
-                s:send(query_pkt)
-                return s
-            end)
-            if ok and sock then
-                table.insert(_parallel_sockets, {
-                    sock = sock,
-                    domain = domain,
-                    upstream = upstream,
-                    start_time = now
-                })
+        -- [4] Kirim UDP Query ke upstream aktif (max 1 domain per tick, max cap socket)
+        if #_parallel_queue > 0 and #_parallel_sockets < (SPEEDCHECK_MAX_PAR_SOCKETS or 30) then
+            local domain = table.remove(_parallel_queue, 1)
+            if domain then
+                _parallel_queue_set[domain] = nil
+                local query_pkt = _build_dns_a_query(domain)
+                for _, upstream in ipairs(_active_upstreams) do
+                    local ok, sock = pcall(function()
+                        local s = _socket.udp()
+                        s:settimeout(0)
+                        s:setpeername(upstream, 53)
+                        s:send(query_pkt)
+                        return s
+                    end)
+                    if ok and sock then
+                        table.insert(_parallel_sockets, {
+                            sock = sock,
+                            domain = domain,
+                            upstream = upstream,
+                            start_time = now
+                        })
+                    end
+                end
             end
         end
     end
@@ -464,17 +534,13 @@ function smartdns_enable_speedcheck()
         return
     end
 
-    -- Auto-populate PARALLEL_UPSTREAMS dari newServer() jika kosong
-    if PARALLEL_UPSTREAMS == nil or #PARALLEL_UPSTREAMS == 0 then
-        PARALLEL_UPSTREAMS = {}
-        local srvs = getServers()
-        for _, s in ipairs(srvs) do
-            -- s:getName() usually returns something like "8.8.8.8:53" or "8.8.8.8"
-            local name = s:getName()
-            local ip = name:match("^([^:]+)") -- Ambil IP saja sebelum titik dua
-            if ip then table.insert(PARALLEL_UPSTREAMS, ip) end
-        end
-        infolog("[SmartDist] Auto-loaded " .. #PARALLEL_UPSTREAMS .. " upstreams for parallel aggregation.")
+    -- Info parallel aggregation
+    if PARALLEL_UPSTREAMS and #PARALLEL_UPSTREAMS > 0 then
+        infolog(string.format("[SmartDist] Parallel aggregation: %d upstream manual ditentukan.", #PARALLEL_UPSTREAMS))
+        _active_upstreams = PARALLEL_UPSTREAMS
+    else
+        infolog(string.format("[SmartDist] Parallel aggregation: auto-select newServer() lat<=%.0fms, top %d.",
+            PARALLEL_UPSTREAM_MAX_LATENCY or 300, PARALLEL_MAX_UPSTREAMS or 5))
     end
 
     addResponseAction(AllRule(), LuaResponseAction(function(dr)
@@ -483,116 +549,127 @@ function smartdns_enable_speedcheck()
         end
 
         local domain = dr.qname:toString():gsub("%.$", "")
+
+        -- BUG FIX #1: FAST PATH — cek hal-hal murah SEBELUM parsing paket yang mahal.
+        -- Jika domain sudah ada di antrian probe, tidak ada yang perlu dilakukan.
+        if _probe_queue_set[domain] then
+            return DNSResponseAction.None, ""
+        end
+
+        -- Jika ada cache hit, langsung masuk ke rewrite tanpa parse dulu.
+        local fastest_ips = _get_fastest(domain)
+
+        -- Jika tidak ada cache dan tidak ada di antrian, kita perlu parse paket
+        -- untuk mengumpulkan IP-IP yang akan di-probe.
+        if not fastest_ips then
+            local pkt_raw = dr:getContent()
+            local overlay = newDNSPacketOverlay(pkt_raw)
+            local record_count = overlay:getRecordsCountInSection(DNSSection.Answer)
+            local record_len = (dr.qtype == DNSQType.AAAA) and 16 or 4
+            local ips = {}
+            for i = 0, record_count - 1 do
+                local rec = overlay:getRecord(i)
+                if rec.type == dr.qtype and rec.contentLength == record_len then
+                    local ip_str
+                    if dr.qtype == DNSQType.AAAA then
+                        ip_str = _bytes_to_ipv6(pkt_raw, rec.contentOffset)
+                    else
+                        ip_str = string.format("%d.%d.%d.%d",
+                            pkt_raw:byte(rec.contentOffset + 1),
+                            pkt_raw:byte(rec.contentOffset + 2),
+                            pkt_raw:byte(rec.contentOffset + 3),
+                            pkt_raw:byte(rec.contentOffset + 4))
+                    end
+                    if ip_str then ips[#ips + 1] = ip_str end
+                end
+            end
+
+            if #ips < 2 then return DNSResponseAction.None, "" end
+
+            -- Masukkan ke antrian probe background
+            _enqueue(domain, ips)
+
+            -- Masukkan ke antrian parallel upstream juga
+            if PARALLEL_UPSTREAMS and #PARALLEL_UPSTREAMS > 0 then
+                if #_parallel_queue < SPEEDCHECK_QUEUE_LIMIT and not _parallel_queue_set[domain] then
+                    table.insert(_parallel_queue, domain)
+                    _parallel_queue_set[domain] = true
+                end
+            end
+
+            -- Untuk query pertama, kembalikan paket asli tanpa diubah
+            return DNSResponseAction.None, ""
+        end
+
+        -- Ada cache hit: lakukan rewrite paket
         local pkt = dr:getContent()
         local overlay = newDNSPacketOverlay(pkt)
         local record_count = overlay:getRecordsCountInSection(DNSSection.Answer)
-
-        -- Kumpulkan semua IP dari response
-        local ips = {}
         local record_len = (dr.qtype == DNSQType.AAAA) and 16 or 4
-        for i = 0, record_count - 1 do
-            local rec = overlay:getRecord(i)
-            if rec.type == dr.qtype and rec.contentLength == record_len then
-                local ip_str
-                if dr.qtype == DNSQType.AAAA then
-                    ip_str = _bytes_to_ipv6(pkt, rec.contentOffset)
-                else
-                    ip_str = string.format("%d.%d.%d.%d",
-                        pkt:byte(rec.contentOffset + 1),
-                        pkt:byte(rec.contentOffset + 2),
-                        pkt:byte(rec.contentOffset + 3),
-                        pkt:byte(rec.contentOffset + 4))
-                end
-                if ip_str then ips[#ips + 1] = ip_str end
-            end
-        end
 
-        -- Jika hanya 1 IP, tidak perlu speedcheck
-        if #ips < 2 then return DNSResponseAction.None, "" end
+        if record_count == 0 then return DNSResponseAction.None, "" end
 
-        local fastest_ips = _get_fastest(domain)
-        if fastest_ips and #fastest_ips > 0 then
-            -- Ada cached fastest IPs: rewrite DNS packet
-            local pkt_bytes = {pkt:byte(1, #pkt)}
-            
-            -- Convert IPs ke array of byte arrays
-            local target_bytes_list = {}
-            for _, fip in ipairs(fastest_ips) do
-                local tbytes = {}
-                if dr.qtype == DNSQType.AAAA then
-                    tbytes = _ipv6_to_bytes(fip)
-                else
-                    for octet in fip:gmatch("%d+") do
-                        tbytes[#tbytes + 1] = tonumber(octet)
-                    end
-                end
-                table.insert(target_bytes_list, tbytes)
-            end
-
-            if SPEEDCHECK_MODE == "fastest-ip" then
-                -- Mode fastest-ip: Reorder (Tukar IP tercepat #1 ke urutan paling atas)
-                local first_rec_offset = nil
-                local fastest_rec_offset = nil
-                local top_target = target_bytes_list[1]
-                
-                for i = 0, record_count - 1 do
-                    local rec = overlay:getRecord(i)
-                    if rec.type == dr.qtype and rec.contentLength == record_len then
-                        if not first_rec_offset then first_rec_offset = rec.contentOffset end
-                        
-                        -- Cek apakah record ini adalah IP tercepat #1 kita
-                        local is_match = true
-                        for b = 1, record_len do
-                            if pkt_bytes[rec.contentOffset + b] ~= top_target[b] then
-                                is_match = false break
-                            end
-                        end
-                        if is_match then fastest_rec_offset = rec.contentOffset end
-                    end
-                end
-
-                -- Lakukan Swap Bytes
-                if first_rec_offset and fastest_rec_offset and first_rec_offset ~= fastest_rec_offset then
-                    for b = 1, record_len do
-                        local temp = pkt_bytes[first_rec_offset + b]
-                        pkt_bytes[first_rec_offset + b] = pkt_bytes[fastest_rec_offset + b]
-                        pkt_bytes[fastest_rec_offset + b] = temp
-                    end
-                end
+        -- Convert fastest IPs ke byte arrays
+        local pkt_bytes = {pkt:byte(1, #pkt)}
+        local target_bytes_list = {}
+        for _, fip in ipairs(fastest_ips) do
+            local tbytes = {}
+            if dr.qtype == DNSQType.AAAA then
+                tbytes = _ipv6_to_bytes(fip)
             else
-                -- Mode fastest-response: Overwrite semua record dengan IP terbaik secara Round-Robin
-                local fip_index = 1
-                for i = 0, record_count - 1 do
-                    local rec = overlay:getRecord(i)
-                    if rec.type == dr.qtype and rec.contentLength == record_len then
-                        local current_target = target_bytes_list[fip_index]
-                        for b = 1, record_len do
-                            pkt_bytes[rec.contentOffset + b] = current_target[b]
+                for octet in fip:gmatch("%d+") do
+                    tbytes[#tbytes + 1] = tonumber(octet)
+                end
+            end
+            table.insert(target_bytes_list, tbytes)
+        end
+
+        if SPEEDCHECK_MODE == "fastest-ip" then
+            -- Mode fastest-ip: Tukar IP tercepat #1 ke urutan paling atas
+            local first_rec_offset = nil
+            local fastest_rec_offset = nil
+            local top_target = target_bytes_list[1]
+
+            for i = 0, record_count - 1 do
+                local rec = overlay:getRecord(i)
+                if rec.type == dr.qtype and rec.contentLength == record_len then
+                    if not first_rec_offset then first_rec_offset = rec.contentOffset end
+                    local is_match = true
+                    for b = 1, record_len do
+                        if pkt_bytes[rec.contentOffset + b] ~= top_target[b] then
+                            is_match = false break
                         end
-                        -- Round robin ke IP juara berikutnya
-                        fip_index = fip_index + 1
-                        if fip_index > #target_bytes_list then fip_index = 1 end
                     end
+                    if is_match then fastest_rec_offset = rec.contentOffset end
                 end
             end
 
-            local parts = {}
-            for _, b in ipairs(pkt_bytes) do parts[#parts + 1] = string.char(b) end
-            dr:setContent(table.concat(parts))
-        else
-            -- Belum ada cache: lempar ke antrian probing background
-            _enqueue(domain, ips)
-            
-            -- Jika Parallel Upstreams diaktifkan, lempar juga ke antrian resolusi paralel!
-            if PARALLEL_UPSTREAMS and #PARALLEL_UPSTREAMS > 0 then
-                -- Cek apakah sudah ada di queue untuk mencegah duplikasi
-                local exists = false
-                for _, d in ipairs(_parallel_queue) do
-                    if d == domain then exists = true break end
+            if first_rec_offset and fastest_rec_offset and first_rec_offset ~= fastest_rec_offset then
+                for b = 1, record_len do
+                    local temp = pkt_bytes[first_rec_offset + b]
+                    pkt_bytes[first_rec_offset + b] = pkt_bytes[fastest_rec_offset + b]
+                    pkt_bytes[fastest_rec_offset + b] = temp
                 end
-                if not exists then table.insert(_parallel_queue, domain) end
+            end
+        else
+            -- Mode fastest-response: Overwrite record dengan top N IP (Round-Robin)
+            local fip_index = 1
+            for i = 0, record_count - 1 do
+                local rec = overlay:getRecord(i)
+                if rec.type == dr.qtype and rec.contentLength == record_len then
+                    local current_target = target_bytes_list[fip_index]
+                    for b = 1, record_len do
+                        pkt_bytes[rec.contentOffset + b] = current_target[b]
+                    end
+                    fip_index = fip_index + 1
+                    if fip_index > #target_bytes_list then fip_index = 1 end
+                end
             end
         end
+
+        local parts = {}
+        for _, b in ipairs(pkt_bytes) do parts[#parts + 1] = string.char(b) end
+        dr:setContent(table.concat(parts))
 
         return DNSResponseAction.None, ""
     end), {name="SmartDist Speed Check Hook"})

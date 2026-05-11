@@ -1,38 +1,38 @@
 # SmartDist
 
-**English** | [Bahasa Indonesia](README_id.md)
+**Bahasa Indonesia** | [English](README_en.md)
 
-> **SmartDNS-style configuration for DnsDist** — Replicate SmartDNS features (IP aliasing, domain-set exclusions, wildcard CNAME, and **automatic speed-check for all domains**) in DnsDist 2.x with a pure Lua plugin.
+> **Konfigurasi bergaya SmartDNS untuk DnsDist** — Mereplikasi fitur-fitur SmartDNS (IP aliasing, pengecualian domain, wildcard CNAME, dan **pengecekan kecepatan otomatis untuk semua domain**) di dalam DnsDist 2.x menggunakan murni Lua plugin.
 
-## ✨ Features
+## ✨ Fitur
 
-- **SmartDNS-like syntax** — Familiar `ip-set`, `domain-set`, `cname`, and `ip-rules` functions
-- **IP Alias (ip-rules)** — Rewrite DNS A/AAAA responses matching a CDN's IP range to your preferred edge IP
-- **Multiple target IPs** — Round-robin support for multiple alias targets
-- **IPv4 & IPv6** — Automatic detection and handling of both A and AAAA records
-- **Domain exclusion** — Skip aliasing for specific domains via domain-set
-- **Wildcard CNAME** — Spoof CNAME for wildcard domain patterns
-- **🆕 Async Speed Check** — Automatically finds the fastest IP for **every domain** using background TCP probing (mimics SmartDNS `speed-check-mode ping,tcp:80,tcp:443`)
-- **Graceful Degradation** — Speed Check silently disables itself if `lua-socket` is not installed; core features still work
-- **Plugin architecture** — Clean separation between plugin logic and user configuration
+- **Sintaks ala SmartDNS** — Familiar dengan fungsi `ip-set`, `domain-set`, `cname`, dan `ip-rules`
+- **IP Alias (ip-rules)** — Mengubah balasan DNS A/AAAA yang cocok dengan *range* IP CDN menuju IP edge pilihan Anda
+- **Multiple Target IPs** — Mendukung *round-robin* untuk banyak IP target
+- **IPv4 & IPv6** — Deteksi dan penanganan otomatis untuk record A maupun AAAA
+- **Pengecualian Domain** — Melewati proses aliasing untuk domain tertentu menggunakan *domain-set*
+- **Wildcard CNAME** — Manipulasi (spoof) CNAME untuk pola domain wildcard
+- **🆕 Async Speed Check** — Secara otomatis mencari IP paling cepat untuk **setiap domain** menggunakan *background TCP probing* (meniru perilaku `speed-check-mode ping,tcp:80,tcp:443` di SmartDNS)
+- **Graceful Degradation** — Speed Check akan mati secara diam-diam jika `lua-socket` tidak terpasang; fitur utama lainnya akan tetap berjalan
+- **Arsitektur Plugin** — Pemisahan yang rapi antara logika plugin dengan konfigurasi pengguna
 
-## 📁 Project Structure
+## 📁 Struktur Proyek
 
 ```
 SmartDist/
-├── dnsdist.conf            # Main config (user rules go here)
-├── smartdns_plugin.lua     # Plugin: SmartDNS compatibility layer + Speed Check
-├── docker-compose.yml      # Docker deployment
-└── cdn-ips/                # IP & domain lists
+├── dnsdist.conf            # Konfigurasi utama (tulis rule Anda di sini)
+├── smartdns_plugin.lua     # Plugin: Lapisan kompatibilitas SmartDNS + Speed Check
+├── docker-compose.yml      # Deployment Docker
+└── cdn-ips/                # Daftar IP & domain
     └── cloudflare/
-        ├── ipv4.txt        # Cloudflare IPv4 ranges
-        ├── ipv6.txt        # Cloudflare IPv6 ranges
-        └── exclude.txt     # Domains to exclude from aliasing
+        ├── ipv4.txt        # Range IPv4 Cloudflare
+        ├── ipv6.txt        # Range IPv6 Cloudflare
+        └── exclude.txt     # Domain yang dikecualikan dari aliasing
 ```
 
-## 🏗 Architecture & Topology (The SmartDNS Behavior)
+## 🏗 Arsitektur & Topologi (Sifat Asli SmartDNS)
 
-SmartDist replicates the highly coveted **Parallel Upstream Aggregation & Fastest IP** mode directly inside DnsDist without external dependencies.
+SmartDist mereplikasi mode canggih **Parallel Upstream Aggregation & Fastest IP** secara langsung di dalam DnsDist tanpa bantuan program luar.
 
 ```mermaid
 sequenceDiagram
@@ -40,27 +40,26 @@ sequenceDiagram
     participant SmartDist
     participant Upstreams
 
-    Client->>SmartDist: 1. DNS Query (e.g. x.com)
+    Client->>SmartDist: 1. DNS Query (contoh: x.com)
     
     rect rgb(240, 248, 255)
-    Note over SmartDist,Upstreams: ⚡ Async Background Process (No Delay for Client)
-    SmartDist--)Upstreams: 2. Parallel Query to 8.8.8.8, 1.1.1.1, etc.
-    Upstreams--)SmartDist: 3. Aggregates all returned IPs
-    SmartDist->>SmartDist: 4. TCP Ping to find the absolute fastest IP!
+    Note over SmartDist,Upstreams: ⚡ Proses Latar Belakang (Tanpa Delay ke Klien)
+    SmartDist--)Upstreams: 2. Query Paralel ke 8.8.8.8, 1.1.1.1, dsb.
+    Upstreams--)SmartDist: 3. Mengagregasi (mengumpulkan) semua IP balasan
+    SmartDist->>SmartDist: 4. TCP Ping untuk mencari IP yang paling cepat!
     end
 
-    SmartDist->>Client: 5. Response returned (Fastest IP moved to the top!)
+    SmartDist->>Client: 5. Response dikembalikan (IP Tercepat dipindah ke posisi teratas!)
 ```
 
-1. **Parallel Querying**: DnsDist sends background queries to ALL upstreams simultaneously. *(Note: Automatically uses the upstreams you define via `newServer()` in `dnsdist.conf`)*.
-2. **Aggregation**: Gathers all IPs returned by all resolvers into one pool.
-3. **Speedcheck**: Pings all IPs using non-blocking TCP Sockets (Port 80/443).
-4. **Fastest-IP Reordering**: Edits the DNS response so the absolute fastest IP is placed at the very top of the list!
+1. **Query Paralel**: SmartDist secara otomatis memilih upstream terbaik dari `newServer()` yang Anda daftarkan — hanya yang **aktif (UP)** dan **latency-nya di bawah ambang batas** yang dipakai. List ini diperbarui secara berkala setiap 30 detik.
+2. **Agregasi**: Mengumpulkan semua IP yang dibalas oleh resolver terpilih menjadi satu wadah (*pool* kandidat).
+3. **Speedcheck**: Melakukan TCP connect secara *non-blocking* (Port 80/443) ke semua IP kandidat tersebut.
+4. **Fastest-IP Reordering**: Mengedit respons DNS dengan menempatkan IP yang paling cepat di posisi teratas, atau mengganti semua IP dengan daftar IP terbaik (mode `fastest-response`).
 
+## 🚀 Memulai Cepat (Quick Start)
 
-## 🚀 Quick Start
-
-### Option A: Docker (Recommended)
+### Opsi A: Docker (Direkomendasikan)
 
 ```bash
 git clone https://github.com/arcelo12/smartdist.git
@@ -68,30 +67,30 @@ cd smartdist
 docker compose up -d
 ```
 
-### Option B: LXC / VM / VPS (Bare-metal)
+### Opsi B: LXC / VM / VPS (Bare-metal)
 
 ```bash
-# Install dependencies
+# Instal dependensi
 apt-get update && apt-get install -y dnsdist lua-socket
 
-# Clone & place config
+# Clone & letakkan konfigurasi
 git clone https://github.com/arcelo12/smartdist.git /etc/smartdist
 cp /etc/smartdist/dnsdist.conf /etc/dnsdist/dnsdist.conf
 cp /etc/smartdist/smartdns_plugin.lua /etc/dnsdist/smartdns_plugin.lua
 
-# Start service
+# Jalankan layanan
 systemctl enable --now dnsdist
 ```
 
-> **Note:** `lua-socket` enables the **Speed Check** feature. Without it, all other features still work normally.
+> **Catatan:** `lua-socket` dibutuhkan agar fitur **Speed Check** dapat menyala. Tanpa plugin ini, semua fitur lain akan tetap berfungsi normal.
 
-### Configure `dnsdist.conf`
+### Konfigurasi `dnsdist.conf`
 
 ```lua
--- Load plugin (FIRST)
+-- Muat plugin (PERINTAH PERTAMA)
 dofile("/etc/dnsdist/smartdns_plugin.lua")
 
--- ... your ip-set, cname, ip-rules rules ...
+-- ... aturan ip-set, cname, ip-rules Anda di sini ...
 
 smartdns_ip_set("cloudflare-ipv4", "/etc/smartdist/cdn-ips/cloudflare/ipv4.txt")
 smartdns_domain_set("cf-exclude", "/etc/smartdist/cdn-ips/cloudflare/exclude.txt")
@@ -101,70 +100,79 @@ smartdns_ip_rules_alias("cloudflare-ipv4", {"172.64.52.159", "172.64.87.224"}, "
 newServer("8.8.8.8")
 newServer("1.1.1.1")
 
--- Speed Check parameters (set di sini, setelah semua rules)
+-- Parameter Speed Check (atur di sini, setelah semua rules)
 SPEEDCHECK_MODE        = "fastest-ip" -- "fastest-ip" atau "fastest-response"
 SPEEDCHECK_TIMEOUT_MS  = 200        -- Timeout TCP connect (ms)
 SPEEDCHECK_PORTS       = {80, 443}  -- Port yang diuji
-SPEEDCHECK_MAX_IPS     = 6          -- Maks IP yang dites per domain
-SPEEDCHECK_MAX_RESPONSE= 2          -- Maks IP yang dikembalikan oleh fastest-response
-SPEEDCHECK_CACHE_TTL   = 300        -- Detik cache hasil tercepat
-SPEEDCHECK_QUEUE_LIMIT = 200        -- Maks antrian background
+SPEEDCHECK_MAX_IPS     = 6          -- Maksimal IP yang dites per domain
+SPEEDCHECK_MAX_RESPONSE= 2          -- Maksimal jumlah IP yang dikembalikan oleh fastest-response
+SPEEDCHECK_CACHE_TTL   = 300        -- Berapa detik menyimpan IP tercepat di memori
+SPEEDCHECK_QUEUE_LIMIT = 200        -- Maksimal antrian di latar belakang
+SPEEDCHECK_MAX_SOCKETS = 120        -- Batas keras socket TCP probe aktif bersamaan
 
--- Aktifkan Speed Check (HARUS di bagian paling bawah)
+-- Parallel Upstream Aggregation (auto-pilih dari newServer() berdasarkan latency)
+-- Kosong = otomatis, akan memilih sendiri dari newServer() yang paling cepat
+PARALLEL_UPSTREAMS            = {}   -- Override manual: {"8.8.8.8", "1.1.1.1"}
+PARALLEL_UPSTREAM_MAX_LATENCY = 300  -- Lewati upstream jika latency > X ms ini
+PARALLEL_MAX_UPSTREAMS        = 5    -- Maks upstream yang dipakai bersamaan
+PARALLEL_UPSTREAM_REFRESH_SEC = 30   -- Seberapa sering rebuild daftar upstream (detik)
+
+-- Aktifkan Speed Check (HARUS diletakkan di bagian paling bawah)
 smartdns_enable_speedcheck()
 ```
 
-### Test
+### Uji Coba
 
 ```bash
-nslookup cloudflare.com <your-server-ip>
-dig youtube.com @<your-server-ip>
+nslookup cloudflare.com <ip-server-anda>
+dig youtube.com @<ip-server-anda>
 ```
 
-## ⚡ Speed Check Feature
+## ⚡ Fitur Speed Check
 
-SmartDist replicates SmartDNS's `speed-check-mode ping,tcp:80,tcp:443` behavior:
+SmartDist mereplikasi fungsionalitas `speed-check-mode ping,tcp:80,tcp:443` dari SmartDNS:
 
 | | SmartDNS | SmartDist |
 |---|---|---|
-| **Method** | Ping + TCP | TCP (port 80 & 443) |
-| **Scope** | All domains | All domains |
-| **Blocking?** | No (async) | No (async, via `maintenance()`) |
-| **Cache TTL** | Dynamic | Configurable (`SPEEDCHECK_CACHE_TTL`) |
-| **Dependency** | Built-in | `lua-socket` |
+| **Metode** | Ping + TCP | TCP (port 80 & 443) |
+| **Cakupan** | Semua domain | Semua domain |
+| **Apakah Memblokir?** | Tidak (async) | Tidak (async, via fungsi `maintenance()`) |
+| **Cache TTL** | Dinamis | Dapat diatur (`SPEEDCHECK_CACHE_TTL`) |
+| **Dependensi** | Bawaan sistem | `lua-socket` |
 
-### How It Works
+### Cara Kerja Detail
 
-1. **First query** for `x.com` → DnsDist returns the initial response from the default upstream normally to prevent stalling. Background: Parallel UDP queries are sent to all `newServer` upstreams.
-2. **Background worker** (`maintenance()`, runs every ~1s) aggregates all returned IPs and opens non-blocking TCP connections to all of them simultaneously.
-3. **First connections** win → the fastest IP(s) are cached as winners for `SPEEDCHECK_CACHE_TTL` seconds.
-4. **Next query** for `x.com` → DnsDist intercepts the response and rewrites it. In `fastest-ip` mode, it reorders the packet to put the absolute fastest IP at the top. In `fastest-response` mode, it overwrites the packet to return only the top N fastest IPs (based on `SPEEDCHECK_MAX_RESPONSE`).
+1. **Query Pertama** untuk `x.com` → DnsDist meneruskan query ke upstream dan langsung mengembalikan respons (tanpa jeda). Di latar belakang, SmartDist menjadwalkan domain ini untuk di-probe.
+2. **Pemilihan Upstream Cerdas** → Setiap 30 detik (dapat diatur), SmartDist memanggil `getServers()` untuk melihat semua `newServer()` Anda, mengukur latency saat ini, lalu otomatis memilih **Top N yang paling cepat** yang merespons di bawah batas `PARALLEL_UPSTREAM_MAX_LATENCY` ms. Upstream yang lambat atau *down* otomatis dilewati.
+3. **Query UDP Paralel** → SmartDist mengirim query DNS untuk domain tersebut ke Top N upstream tersebut secara bersamaan, mengumpulkan semua IP balasan menjadi satu *pool* kandidat.
+4. **TCP Probing di Latar Belakang** (`maintenance()`, berjalan tiap ~1 detik) → TCP connect *non-blocking* ke semua IP kandidat pada port 80 dan 443. IP pertama yang merespons sebanyak `SPEEDCHECK_MAX_RESPONSE` buah dicache sebagai "juara".
+5. **Query Berikutnya** untuk `x.com` → DnsDist menulis ulang respons. Mode `fastest-ip`: mengurutkan paket agar IP tercepat #1 di urutan teratas. Mode `fastest-response`: menimpa semua record dengan Top N IP tercepat secara *round-robin*.
 
-## 🔌 Plugin API Reference
+## 🔌 Referensi API Plugin
 
 ### `smartdns_ip_set(name, filepath)`
 
-Load an IP range list into a named NetmaskGroup.
+Memuat daftar *range* IP ke dalam NetmaskGroup.
 
 ```lua
 smartdns_ip_set("cloudflare-ipv4", "/etc/smartdist/cdn-ips/cloudflare/ipv4.txt")
 ```
 
-**File format:** One CIDR per line (e.g. `173.245.48.0/20`). Lines starting with `#` are ignored.
+**Format file:** Satu CIDR per baris (misal `173.245.48.0/20`). Baris yang diawali dengan `#` akan diabaikan.
 
 ### `smartdns_domain_set(name, filepath)`
 
-Load a domain list into a named SuffixMatchNode.
+Memuat daftar domain ke dalam SuffixMatchNode.
 
 ```lua
 smartdns_domain_set("cf-exclude", "/etc/smartdist/cdn-ips/cloudflare/exclude.txt")
 ```
 
-**File format:** One domain per line. Wildcard prefix `*.` is auto-stripped.
+**Format file:** Satu domain per baris. Awalan wildcard `*.` otomatis dihapus.
 
 ### `smartdns_cname(pattern, target)`
 
-Spoof CNAME for matching domains (supports SmartDNS `-.` and `.` wildcard prefixes).
+Memanipulasi CNAME untuk domain yang cocok (mendukung awalan `-.` dan `.` seperti di SmartDNS).
 
 ```lua
 smartdns_cname("-.api.x.com", "api.x.com.cdn.cloudflare.net.")
@@ -172,45 +180,60 @@ smartdns_cname("-.api.x.com", "api.x.com.cdn.cloudflare.net.")
 
 ### `smartdns_ip_rules_alias(ip_set_name, target_ips, exclude_domain_set)`
 
-Rewrite DNS responses: if any A/AAAA record matches the ip-set, replace all matching records with target IP(s).
+Mengubah ulang (rewrite) respons DNS: jika ada record A/AAAA yang cocok dengan ip-set, gantikan IP tersebut dengan IP target pilihan Anda.
 
 ```lua
--- Single target
+-- Target tunggal
 smartdns_ip_rules_alias("cloudflare-ipv4", "172.64.87.224", "cf-exclude")
 
--- Multiple targets (round-robin)
+-- Target ganda (round-robin)
 smartdns_ip_rules_alias("cloudflare-ipv4", {"172.64.52.159", "172.64.87.224"}, "cf-exclude")
 ```
 
 ### `smartdns_enable_speedcheck()`
 
-Activate the global asynchronous speed check hook for all domains. Call this **once**, at the **end** of your `dnsdist.conf` after all other rules.
+Mengaktifkan fitur global *async speed check* untuk seluruh domain. Panggil fungsi ini **sekali saja**, di bagian **paling bawah** `dnsdist.conf` setelah Anda menetapkan semua aturan.
 
 ```lua
 smartdns_enable_speedcheck()
 ```
 
-### Speed Check Globals (set in `dnsdist.conf` after rules, before `smartdns_enable_speedcheck()`)
+### Variabel Global Speed Check
 
-| Variable | Default | Description |
+Atur variabel-variabel ini di `dnsdist.conf`, setelah semua *rules*, sebelum memanggil `smartdns_enable_speedcheck()`.
+
+#### Variabel Utama Speed Check
+
+| Variabel | Default | Deskripsi |
 |---|---|---|
-| `SPEEDCHECK_ENABLED` | `true` | Master on/off switch |
-| `SPEEDCHECK_MODE` | `"fastest-ip"` | `"fastest-ip"` (reorder) or `"fastest-response"` (top N IPs overwrite) |
-| `SPEEDCHECK_TIMEOUT_MS` | `200` | TCP connect timeout (ms) |
-| `SPEEDCHECK_PORTS` | `{80, 443}` | Ports to test |
-| `SPEEDCHECK_MAX_IPS` | `6` | Max IPs tested per domain |
-| `SPEEDCHECK_MAX_RESPONSE`| `2` | Max winning IPs to return (for fastest-response) |
-| `SPEEDCHECK_CACHE_TTL` | `300` | Seconds to cache result |
-| `SPEEDCHECK_QUEUE_LIMIT` | `200` | Max concurrent probe queue size |
+| `SPEEDCHECK_ENABLED` | `true` | Tombol utama nyala/mati |
+| `SPEEDCHECK_MODE` | `"fastest-ip"` | `"fastest-ip"` (*reorder*) atau `"fastest-response"` (*overwrite top N IP*) |
+| `SPEEDCHECK_TIMEOUT_MS` | `200` | Batas timeout TCP connect (milidetik) |
+| `SPEEDCHECK_PORTS` | `{80, 443}` | Port TCP yang akan diping |
+| `SPEEDCHECK_MAX_IPS` | `6` | Batas maksimal IP yang dites per domain |
+| `SPEEDCHECK_MAX_RESPONSE`| `2` | Batas IP Juara yang dikembalikan oleh fastest-response |
+| `SPEEDCHECK_CACHE_TTL` | `300` | Lama detik menyimpan hasil di memori |
+| `SPEEDCHECK_QUEUE_LIMIT` | `200` | Kapasitas maksimal antrian *background probing* |
+| `SPEEDCHECK_MAX_SOCKETS` | `120` | Batas keras socket TCP probe aktif bersamaan |
 
-## 📋 Requirements
+#### Variabel Parallel Upstream Aggregation
 
-| Component | Requirement |
+| Variabel | Default | Deskripsi |
+|---|---|---|
+| `PARALLEL_UPSTREAMS` | `{}` (otomatis) | Daftar upstream manual. Kosong = auto-pilih dari `newServer()` |
+| `PARALLEL_UPSTREAM_MAX_LATENCY` | `300` | Lewati upstream yang lambatnya melebihi nilai ini (ms) |
+| `PARALLEL_MAX_UPSTREAMS` | `5` | Maks upstream yang dipakai bersamaan |
+| `PARALLEL_UPSTREAM_REFRESH_SEC` | `30` | Seberapa sering daftar upstream diperbarui |
+| `SPEEDCHECK_MAX_PAR_SOCKETS` | `30` | Batas keras socket UDP parallel |
+
+## 📋 Persyaratan Sistem
+
+| Komponen | Syarat |
 |---|---|
-| DnsDist | 2.x (tested on 2.0.5) |
-| lua-socket | For Speed Check feature (optional) |
-| Docker | For containerized deployment |
+| DnsDist | 2.x (telah dites di versi 2.0.5) |
+| lua-socket | Untuk menyalakan fitur Speed Check (opsional) |
+| Docker | Untuk penyebaran (deployment) via container |
 
-## 📜 License
+## 📜 Lisensi
 
 MIT
