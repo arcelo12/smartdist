@@ -1,5 +1,7 @@
 # SmartDist
 
+**English** | [Bahasa Indonesia](README_id.md)
+
 > **SmartDNS-style configuration for DnsDist** — Replicate SmartDNS features (IP aliasing, domain-set exclusions, wildcard CNAME, and **automatic speed-check for all domains**) in DnsDist 2.x with a pure Lua plugin.
 
 ## ✨ Features
