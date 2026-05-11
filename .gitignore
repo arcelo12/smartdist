@@ -14,3 +14,5 @@ cf-node-test.sh
 *.swo
 *~
 cf-test-domains.txt
+private/
+smartdist-prober/
