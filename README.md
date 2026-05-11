@@ -13,7 +13,6 @@
 - **🆕 Async Speed Check** — Automatically finds the fastest IP for **every domain** using background TCP probing (mimics SmartDNS `speed-check-mode ping,tcp:80,tcp:443`)
 - **Graceful Degradation** — Speed Check silently disables itself if `lua-socket` is not installed; core features still work
 - **Plugin architecture** — Clean separation between plugin logic and user configuration
-- **Cloudflare Node Checker** — Built-in Go TUI tool to verify which CF edge node you're hitting
 
 ## 📁 Project Structure
 
@@ -22,17 +21,11 @@ SmartDist/
 ├── dnsdist.conf            # Main config (user rules go here)
 ├── smartdns_plugin.lua     # Plugin: SmartDNS compatibility layer + Speed Check
 ├── docker-compose.yml      # Docker deployment
-├── cdn-ips/                # IP & domain lists
-│   └── cloudflare/
-│       ├── ipv4.txt        # Cloudflare IPv4 ranges
-│       ├── ipv6.txt        # Cloudflare IPv6 ranges
-│       └── exclude.txt     # Domains to exclude from aliasing
-├── cf-node-test.sh         # Bash CF node checker (lightweight)
-├── cf-checker/             # Go TUI CF node checker (parallel)
-│   └── main.go
-└── smartdist-prober/       # (Optional) Go Daemon for static IP pool probing
-    ├── main.go
-    └── config.json
+└── cdn-ips/                # IP & domain lists
+    └── cloudflare/
+        ├── ipv4.txt        # Cloudflare IPv4 ranges
+        ├── ipv6.txt        # Cloudflare IPv6 ranges
+        └── exclude.txt     # Domains to exclude from aliasing
 ```
 
 ## 🏗 Architecture & Topology (The SmartDNS Behavior)
@@ -57,7 +50,7 @@ sequenceDiagram
     SmartDist->>Client: 5. Response returned (Fastest IP moved to the top!)
 ```
 
-1. **Parallel Querying**: DnsDist sends background queries to ALL upstreams simultaneously.
+1. **Parallel Querying**: DnsDist sends background queries to ALL upstreams simultaneously. *(Note: Automatically uses the upstreams you define via `newServer()` in `dnsdist.conf`)*.
 2. **Aggregation**: Gathers all IPs returned by all resolvers into one pool.
 3. **Speedcheck**: Pings all IPs using non-blocking TCP Sockets (Port 80/443).
 4. **Fastest-IP Reordering**: Edits the DNS response so the absolute fastest IP is placed at the very top of the list!
@@ -107,6 +100,7 @@ newServer("8.8.8.8")
 newServer("1.1.1.1")
 
 -- Speed Check parameters (set di sini, setelah semua rules)
+SPEEDCHECK_MODE        = "fastest-ip" -- "fastest-ip" atau "fastest-response"
 SPEEDCHECK_TIMEOUT_MS  = 200        -- Timeout TCP connect (ms)
 SPEEDCHECK_PORTS       = {80, 443}  -- Port yang diuji
 SPEEDCHECK_MAX_IPS     = 6          -- Maks IP yang dites per domain
@@ -138,10 +132,10 @@ SmartDist replicates SmartDNS's `speed-check-mode ping,tcp:80,tcp:443` behavior:
 
 ### How It Works
 
-1. **First query** for `youtube.com` → DnsDist returns all IPs from upstream normally. Background: all IPs are queued for TCP probing.
-2. **Background worker** (`maintenance()`, runs every ~1s) opens non-blocking TCP connections to all queued IPs simultaneously.
+1. **First query** for `x.com` → DnsDist returns the initial response from the default upstream normally to prevent stalling. Background: Parallel UDP queries are sent to all `newServer` upstreams.
+2. **Background worker** (`maintenance()`, runs every ~1s) aggregates all returned IPs and opens non-blocking TCP connections to all of them simultaneously.
 3. **First to respond** wins → its IP is cached as "fastest" for `SPEEDCHECK_CACHE_TTL` seconds.
-4. **Next query** for `youtube.com` → DnsDist rewrites the DNS response to return only the fastest IP.
+4. **Next query** for `x.com` → DnsDist intercepts the response and reorders it (`fastest-ip` mode) so the winning IP is at the top.
 
 ## 🔌 Plugin API Reference
 
@@ -198,20 +192,12 @@ smartdns_enable_speedcheck()
 | Variable | Default | Description |
 |---|---|---|
 | `SPEEDCHECK_ENABLED` | `true` | Master on/off switch |
+| `SPEEDCHECK_MODE` | `"fastest-ip"` | `"fastest-ip"` (reorder) or `"fastest-response"` (single IP overwrite) |
 | `SPEEDCHECK_TIMEOUT_MS` | `200` | TCP connect timeout (ms) |
 | `SPEEDCHECK_PORTS` | `{80, 443}` | Ports to test |
 | `SPEEDCHECK_MAX_IPS` | `6` | Max IPs tested per domain |
 | `SPEEDCHECK_CACHE_TTL` | `300` | Seconds to cache result |
 | `SPEEDCHECK_QUEUE_LIMIT` | `200` | Max concurrent probe queue size |
-
-### Go TUI (parallel, real-time)
-
-```bash
-cd cf-checker && go build -o cf-checker-bin .
-./cf-checker-bin --dns <dns-server-ip>
-```
-
-Features: 10 concurrent goroutines, IPv6 priority, real-time spinner, scrollable table, progress bar, CF node summary.
 
 ## 📋 Requirements
 
@@ -220,7 +206,6 @@ Features: 10 concurrent goroutines, IPv6 priority, real-time spinner, scrollable
 | DnsDist | 2.x (tested on 2.0.5) |
 | lua-socket | For Speed Check feature (optional) |
 | Docker | For containerized deployment |
-| Go 1.21+ | Only for building cf-checker |
 
 ## 📜 License
 
