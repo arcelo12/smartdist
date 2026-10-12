@@ -18,11 +18,20 @@ local _has_socket, _socket = pcall(require, "socket")
 
 -- Cache hasil speed check: { domain = { ip, expires_at } }
 local _speed_cache = {}
+
 -- Antrian probing: { { domain, ips[], timestamp } }
 local _probe_queue = {}
 local _probe_queue_set = {} -- O(1) lookup
+
 -- Sesi socket aktif (non-blocking): { { sock, ip, domain, start_time } }
 local _active_sockets = {}
+
+-- Domain yang sudah di-rewrite oleh ip_rules_alias.
+local _aliased_domains = {}
+
+-- State untuk Garbage Collection
+local _sweep_key = nil
+local _last_alias_clear = 0
 
 -- Konfigurasi Speed Check (dapat di-override di dnsdist.conf sebelum dofile())
 SPEEDCHECK_ENABLED     = true       -- Aktifkan/nonaktifkan fitur ini
@@ -34,6 +43,7 @@ SPEEDCHECK_MAX_RESPONSE= 2          -- Maksimal jumlah IP Juara yang dikembalika
 SPEEDCHECK_CACHE_TTL   = 300        -- Detik menyimpan hasil di memori
 SPEEDCHECK_QUEUE_LIMIT = 200        -- Maks antrian domain sekaligus
 SPEEDCHECK_MAX_SOCKETS = 120        -- BUG FIX #3: Batas maksimal socket TCP aktif (6 IP x 2 port x 10 domain)
+SPEEDCHECK_MAX_MEMORY_MB= 50        -- Batas maksimal RAM (Megabyte) untuk plugin Lua sebelum membuang cache lama
 
 -- Konfigurasi Parallel Upstream Aggregation
 -- Secara default SmartDist menggunakan newServer() yang sudah dikonfigurasi,
@@ -81,10 +91,13 @@ end
 -- Ambil cached IP tercepat untuk sebuah domain (nil jika belum ada/expired)
 local function _get_fastest(domain)
     local entry = _speed_cache[domain]
-    if entry and _now() < entry.expires_at then
-        return entry.ips
+    if entry then
+        if _now() < entry.expires_at then
+            return entry.ips
+        else
+            _speed_cache[domain] = nil
+        end
     end
-    _speed_cache[domain] = nil
     return nil
 end
 
@@ -108,11 +121,19 @@ end
 
 -- Fungsi maintenance() dijalankan DnsDist setiap ~1 detik
 -- Ini adalah "background worker" kita
+-- PENTING: Harus cepat! DnsDist memblokir pemrosesan query saat ini berjalan.
+local _MAINTENANCE_BUDGET_SEC = 0.030  -- Maks 30ms per tick
+
 function maintenance()
     if not SPEEDCHECK_ENABLED then return end
 
     local timeout_sec = SPEEDCHECK_TIMEOUT_MS / 1000
     local now = _now()
+    local budget_start = now
+
+    local function over_budget()
+        return (_now() - budget_start) > _MAINTENANCE_BUDGET_SEC
+    end
 
     -- [0] SMART UPSTREAM REFRESH: Rebuild list upstream dari newServer() secara berkala.
     -- Hanya upstream yang UP dan latency-nya di bawah threshold yang dipilih.
@@ -157,12 +178,22 @@ function maintenance()
         end
     end
 
+    -- Cek budget sebelum mulai [1] yang berat
+    if over_budget() then return end
+
     -- [1] Periksa socket aktif: siapa yang sudah konek?
+    -- Poll maksimal 40 socket per tick untuk menjaga budget waktu
     local still_active = {}
-    for _, sess in ipairs(_active_sockets) do
-        if (now - sess.start_time) > timeout_sec then
+    local polled = 0
+    local max_poll = math.min(40, #_active_sockets)
+    for idx, sess in ipairs(_active_sockets) do
+        if polled >= max_poll then
+            -- Sisa socket ditunda ke tick berikutnya
+            still_active[#still_active + 1] = sess
+        elseif (now - sess.start_time) > timeout_sec then
             -- Timeout: buang
             pcall(function() sess.sock:close() end)
+            polled = polled + 1
         else
             local res, err = sess.sock:connect(sess.ip, sess.port)
             -- luasocket mengembalikan 1 saat koneksi non-blocking berhasil
@@ -171,6 +202,14 @@ function maintenance()
                 local latency_ms = math.floor((now - sess.start_time) * 1000)
                 local entry = _speed_cache[sess.domain]
                 if not entry then
+                    -- CEK HARD LIMIT MEMORY (Berdasarkan RAM sesungguhnya)
+                    -- collectgarbage("count") mengembalikan ukuran RAM Lua dalam Kilobyte
+                    if (collectgarbage("count") / 1024) > (SPEEDCHECK_MAX_MEMORY_MB or 50) then
+                        -- Eviction: buang 1 elemen pseudo-acak dari memori untuk memberi ruang
+                        local k, _ = next(_speed_cache)
+                        if k then _speed_cache[k] = nil end
+                    end
+                    
                     entry = { ips = {}, expires_at = now + SPEEDCHECK_CACHE_TTL }
                     _speed_cache[sess.domain] = entry
                 end
@@ -184,21 +223,30 @@ function maintenance()
                     table.insert(entry.ips, sess.ip)
                     infolog(string.format("[SmartDist] Fastest Rank #%d for %s -> %s (%dms)",
                         #entry.ips, sess.domain, sess.ip, latency_ms))
+                    -- PERHATIAN: DnsDist expungeByName() TIDAK BOLEH digunakan di sini.
+                    -- expungeByName melakukan iterasi (O(N)) ke SEMUA isi cache. 
+                    -- Jika cache ada jutaan, ini akan membuat DnsDist FREEZE selama 
+                    -- beberapa detik sehingga SEMUA health check ping akan timeout serentak!
                 end
                 pcall(function() sess.sock:close() end)
             else
                 -- Masih menunggu (TIMEOUT atau belum selesai)
                 still_active[#still_active + 1] = sess
             end
+            polled = polled + 1
         end
     end
     _active_sockets = still_active
 
+    -- Cek budget sebelum buka socket baru
+    if over_budget() then return end
+
     -- [2] DRAIN BATCH: Ambil item dari antrian, buka socket jika masih ada slot
-    -- BUG FIX #3: Jangan buka socket baru jika sudah melebihi batas
+    -- Max 2 domain per tick untuk menjaga budget waktu
     if #_active_sockets < (SPEEDCHECK_MAX_SOCKETS or 120) then
-        local drain_count = math.min(5, #_probe_queue)
+        local drain_count = math.min(2, #_probe_queue)
         for i = 1, drain_count do
+            if over_budget() then break end
             local item = table.remove(_probe_queue, 1)
             if item then
                 for _, ip in ipairs(item.ips) do
@@ -223,6 +271,7 @@ function maintenance()
                 -- BUG FIX #2: Hapus dari set SETELAH semua socket domain ini dibuka
                 _probe_queue_set[item.domain] = nil
             end
+
         end
     end
 
@@ -286,6 +335,29 @@ function maintenance()
                 end
             end
         end
+    end
+
+    -- [5] MEMORY GARBAGE COLLECTION
+    -- 5a. Hapus cache speed check yang sudah basi (Sweep 50 entry per tick agar tidak blokir thread)
+    local sweep_count = 0
+    while sweep_count < 50 do
+        local k, v = next(_speed_cache, _sweep_key)
+        if k == nil then
+            _sweep_key = nil -- Ulang dari awal tabel jika sudah mencapai akhir
+            break
+        end
+        local next_k = k
+        if now > v.expires_at then
+            _speed_cache[k] = nil
+        end
+        _sweep_key = next_k
+        sweep_count = sweep_count + 1
+    end
+
+    -- 5b. Bersihkan tabel _aliased_domains setiap 1 jam sekali agar tidak melembung
+    if (now - _last_alias_clear) > 3600 then
+        _aliased_domains = {}
+        _last_alias_clear = now
     end
 end
 
@@ -377,6 +449,48 @@ function smartdns_domain_set(name, filepath)
 end
 
 -- ============================================================================
+-- EXCLUDE GLOBAL: domain yang tidak di-redirect (CNAME, ip-alias, speed-check).
+-- Prioritas: api-allow > api-exclude > heuristik label "api".
+-- Isi set via: smartdns_domain_set(EXCLUDE_DOMAIN_SET, "<file>") di dnsdist.conf.
+-- ============================================================================
+EXCLUDE_DOMAIN_SET = EXCLUDE_DOMAIN_SET or "api-exclude"
+API_ALLOW_SET      = API_ALLOW_SET or "api-allow"
+if EXCLUDE_API_LIKE == nil then EXCLUDE_API_LIKE = true end
+
+_excluded_logged = {}
+_rewrite_logged = {}
+
+-- Heuristik "berbau api": label domain sama dengan "api", diawali "api-",
+-- diakhiri "-api", atau "api" + angka (api2). Contoh: api.x.com, x.api.com,
+-- api-v2.x.com, x-api.com, api2.x.com.
+function smartdns_is_api_like(s)
+    for label in s:gmatch("[^%.]+") do
+        if label == "api" or label:match("^api%-") or label:match("%-api$") or label:match("^api%d+$") then
+            return true
+        end
+    end
+    return false
+end
+
+function smartdns_is_excluded(qname)
+    local s = qname:toString():lower()
+    local allow = smartdns_smn[API_ALLOW_SET]
+    if allow and allow:check(qname) then
+        return false
+    end
+    local excluded = false
+    local set = smartdns_smn[EXCLUDE_DOMAIN_SET]
+    if (set and set:check(qname)) or (EXCLUDE_API_LIKE and smartdns_is_api_like(s)) then
+        excluded = true
+    end
+    if excluded and not _excluded_logged[s] then
+        _excluded_logged[s] = true
+        infolog("smartdns: excluded from redirect: " .. s)
+    end
+    return excluded
+end
+
+-- ============================================================================
 -- Meniru fungsi: cname /domain/target
 -- ============================================================================
 function smartdns_cname(domain_pattern, target_cname)
@@ -387,8 +501,16 @@ function smartdns_cname(domain_pattern, target_cname)
     elseif clean_domain:sub(1, 1) == "." then
         clean_domain = clean_domain:sub(2)
     end
-    addAction(SuffixMatchNodeRule(clean_domain), SpoofCNAMEAction(target_cname), {name="CNAME: " .. target_cname})
-    infolog("smartdns: CNAME rule added: *." .. clean_domain .. " -> " .. target_cname)
+    -- Gunakan QNAME Flattening: Ubah query ke target_cname, biarkan upstream meresolve,
+    -- lalu DnsDist otomatis mengembalikan A record-nya ke klien dengan nama awal.
+    addAction(SuffixMatchNodeRule(clean_domain), LuaAction(function(dq)
+        if smartdns_is_excluded(dq.qname) then
+            return DNSAction.None
+        end
+        dq.qname = newDNSName(target_cname)
+        return DNSAction.None
+    end))
+    infolog("smartdns: CNAME rule added: *." .. clean_domain .. " -> (Flattened) " .. target_cname)
 end
 
 -- ============================================================================
@@ -456,6 +578,11 @@ function smartdns_ip_rules_alias(ip_set_name, target_ips, exclude_domain_set)
             end
         end
 
+        -- Exclude global (api-exclude + heuristik label api, kecuali api-allow)
+        if smartdns_is_excluded(dr.qname) then
+            return DNSResponseAction.None, ""
+        end
+
         -- Parse paket response
         local pkt = dr:getContent()
         local overlay = newDNSPacketOverlay(pkt)
@@ -517,6 +644,24 @@ function smartdns_ip_rules_alias(ip_set_name, target_ips, exclude_domain_set)
                 parts[#parts + 1] = string.char(b)
             end
             dr:setContent(table.concat(parts))
+
+            -- Audit: catat domain yang di-rewrite (sekali per domain/proses)
+            local rw = dr.qname:toString():lower()
+            if not _rewrite_logged[rw] then
+                _rewrite_logged[rw] = true
+                infolog("smartdns: ip-rules rewrite applied: " .. rw)
+            end
+
+            -- Tandai domain ini sebagai "aliased" agar SmartDist speedcheck
+            -- tidak menimpa rewrite ip_rules_alias dengan IP dari speed_cache.
+            local aliased_domain = dr.qname:toString():gsub("%.$", "")
+            if not _aliased_domains[aliased_domain] then
+                if (collectgarbage("count") / 1024) > (SPEEDCHECK_MAX_MEMORY_MB or 50) then
+                    local k, _ = next(_aliased_domains)
+                    if k then _aliased_domains[k] = nil end
+                end
+                _aliased_domains[aliased_domain] = true
+            end
         end
         
         return DNSResponseAction.None, ""
@@ -548,6 +693,11 @@ function smartdns_enable_speedcheck()
             return DNSResponseAction.None, ""
         end
 
+        -- EXCLUDE GLOBAL: domain exclude tidak boleh di-rewrite sama sekali
+        if smartdns_is_excluded(dr.qname) then
+            return DNSResponseAction.None, ""
+        end
+
         local domain = dr.qname:toString():gsub("%.$", "")
 
         -- BUG FIX #1: FAST PATH — cek hal-hal murah SEBELUM parsing paket yang mahal.
@@ -556,7 +706,13 @@ function smartdns_enable_speedcheck()
             return DNSResponseAction.None, ""
         end
 
+        -- Jika domain sudah di-handle ip_rules_alias (IP sudah fixed), skip rewrite.
+        -- SmartDist tetap bisa probe IP-nya, tapi tidak perlu reorder/overwrite.
+        local is_aliased = _aliased_domains[domain]
+
         -- Jika ada cache hit, langsung masuk ke rewrite tanpa parse dulu.
+        -- Kecuali domain aliased — untuk domain aliased, cache hit tetap dilanjutkan
+        -- ke bawah agar bisa probe (tp tidak rewrite).
         local fastest_ips = _get_fastest(domain)
 
         -- Jika tidak ada cache dan tidak ada di antrian, kita perlu parse paket
@@ -590,7 +746,8 @@ function smartdns_enable_speedcheck()
             _enqueue(domain, ips)
 
             -- Masukkan ke antrian parallel upstream juga
-            if PARALLEL_UPSTREAMS and #PARALLEL_UPSTREAMS > 0 then
+            -- BUG FIX: gunakan _active_upstreams, bukan PARALLEL_UPSTREAMS manual
+            if #_active_upstreams > 0 then
                 if #_parallel_queue < SPEEDCHECK_QUEUE_LIMIT and not _parallel_queue_set[domain] then
                     table.insert(_parallel_queue, domain)
                     _parallel_queue_set[domain] = true
@@ -602,74 +759,108 @@ function smartdns_enable_speedcheck()
         end
 
         -- Ada cache hit: lakukan rewrite paket
-        local pkt = dr:getContent()
-        local overlay = newDNSPacketOverlay(pkt)
-        local record_count = overlay:getRecordsCountInSection(DNSSection.Answer)
-        local record_len = (dr.qtype == DNSQType.AAAA) and 16 or 4
-
-        if record_count == 0 then return DNSResponseAction.None, "" end
-
-        -- Convert fastest IPs ke byte arrays
-        local pkt_bytes = {pkt:byte(1, #pkt)}
-        local target_bytes_list = {}
-        for _, fip in ipairs(fastest_ips) do
-            local tbytes = {}
-            if dr.qtype == DNSQType.AAAA then
-                tbytes = _ipv6_to_bytes(fip)
-            else
-                for octet in fip:gmatch("%d+") do
-                    tbytes[#tbytes + 1] = tonumber(octet)
-                end
-            end
-            table.insert(target_bytes_list, tbytes)
+        -- SKIP rewrite jika domain sudah di-handle ip_rules_alias (IP sudah fixed)
+        if is_aliased then
+            return DNSResponseAction.None, ""
         end
 
-        if SPEEDCHECK_MODE == "fastest-ip" then
-            -- Mode fastest-ip: Tukar IP tercepat #1 ke urutan paling atas
-            local first_rec_offset = nil
-            local fastest_rec_offset = nil
-            local top_target = target_bytes_list[1]
+        -- Wrap seluruh rewrite dalam pcall untuk mencegah crash diam-diam
+        -- yang bisa menyebabkan DnsDist men-cache response kosong/rusak
+        local rewrite_ok, rewrite_err = pcall(function()
+            local pkt = dr:getContent()
+            local overlay = newDNSPacketOverlay(pkt)
+            local record_count = overlay:getRecordsCountInSection(DNSSection.Answer)
+            local record_len = (dr.qtype == DNSQType.AAAA) and 16 or 4
 
-            for i = 0, record_count - 1 do
-                local rec = overlay:getRecord(i)
-                if rec.type == dr.qtype and rec.contentLength == record_len then
-                    if not first_rec_offset then first_rec_offset = rec.contentOffset end
-                    local is_match = true
-                    for b = 1, record_len do
-                        if pkt_bytes[rec.contentOffset + b] ~= top_target[b] then
-                            is_match = false break
+            if record_count == 0 then return end
+
+            -- Convert fastest IPs ke byte arrays
+            local pkt_bytes = {pkt:byte(1, #pkt)}
+            local target_bytes_list = {}
+            for _, fip in ipairs(fastest_ips) do
+                local tbytes = {}
+                if dr.qtype == DNSQType.AAAA then
+                    tbytes = _ipv6_to_bytes(fip)
+                else
+                    for octet in fip:gmatch("%d+") do
+                        tbytes[#tbytes + 1] = tonumber(octet)
+                    end
+                end
+                if #tbytes == record_len then
+                    table.insert(target_bytes_list, tbytes)
+                end
+            end
+
+            if #target_bytes_list == 0 then return end
+
+            if SPEEDCHECK_MODE == "fastest-ip" then
+                -- Mode fastest-ip: Reorder agar Top N IP tercepat berada di urutan teratas
+                -- 1. Kumpulkan semua offset record A/AAAA yang valid
+                local record_offsets = {}
+                for i = 0, record_count - 1 do
+                    local rec = overlay:getRecord(i)
+                    if rec.type == dr.qtype and rec.contentLength == record_len then
+                        table.insert(record_offsets, rec.contentOffset)
+                    end
+                end
+
+                -- 2. Tukar posisi IP tercepat secara berurutan
+                for k, target_bytes in ipairs(target_bytes_list) do
+                    if k > #record_offsets then break end
+                    
+                    local found_idx = nil
+                    -- Cari IP target ini mulai dari posisi ke-k ke bawah
+                    for m = k, #record_offsets do
+                        local is_match = true
+                        local offset_m = record_offsets[m]
+                        for b = 1, record_len do
+                            if pkt_bytes[offset_m + b] ~= target_bytes[b] then
+                                is_match = false break
+                            end
+                        end
+                        if is_match then
+                            found_idx = m
+                            break
                         end
                     end
-                    if is_match then fastest_rec_offset = rec.contentOffset end
-                end
-            end
 
-            if first_rec_offset and fastest_rec_offset and first_rec_offset ~= fastest_rec_offset then
-                for b = 1, record_len do
-                    local temp = pkt_bytes[first_rec_offset + b]
-                    pkt_bytes[first_rec_offset + b] = pkt_bytes[fastest_rec_offset + b]
-                    pkt_bytes[fastest_rec_offset + b] = temp
-                end
-            end
-        else
-            -- Mode fastest-response: Overwrite record dengan top N IP (Round-Robin)
-            local fip_index = 1
-            for i = 0, record_count - 1 do
-                local rec = overlay:getRecord(i)
-                if rec.type == dr.qtype and rec.contentLength == record_len then
-                    local current_target = target_bytes_list[fip_index]
-                    for b = 1, record_len do
-                        pkt_bytes[rec.contentOffset + b] = current_target[b]
+                    -- Jika ditemukan, tukar dengan record di posisi ke-k
+                    if found_idx and found_idx ~= k then
+                        local offset_k = record_offsets[k]
+                        local offset_m = record_offsets[found_idx]
+                        for b = 1, record_len do
+                            local temp = pkt_bytes[offset_k + b]
+                            pkt_bytes[offset_k + b] = pkt_bytes[offset_m + b]
+                            pkt_bytes[offset_m + b] = temp
+                        end
                     end
-                    fip_index = fip_index + 1
-                    if fip_index > #target_bytes_list then fip_index = 1 end
+                end
+            else
+                -- Mode fastest-response: Overwrite record dengan top N IP (Round-Robin)
+                local fip_index = 1
+                for i = 0, record_count - 1 do
+                    local rec = overlay:getRecord(i)
+                    if rec.type == dr.qtype and rec.contentLength == record_len then
+                        local current_target = target_bytes_list[fip_index]
+                        for b = 1, record_len do
+                            pkt_bytes[rec.contentOffset + b] = current_target[b]
+                        end
+                        fip_index = fip_index + 1
+                        if fip_index > #target_bytes_list then fip_index = 1 end
+                    end
                 end
             end
-        end
 
-        local parts = {}
-        for _, b in ipairs(pkt_bytes) do parts[#parts + 1] = string.char(b) end
-        dr:setContent(table.concat(parts))
+            local parts = {}
+            for _, b in ipairs(pkt_bytes) do parts[#parts + 1] = string.char(b) end
+            dr:setContent(table.concat(parts))
+        end)
+
+        if not rewrite_ok then
+            warnlog("[SmartDist] Rewrite error untuk " .. domain .. ": " .. tostring(rewrite_err))
+            -- Hapus cache entry yang mungkin bermasalah
+            _speed_cache[domain] = nil
+        end
 
         return DNSResponseAction.None, ""
     end), {name="SmartDist Speed Check Hook"})

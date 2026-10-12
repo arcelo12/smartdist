@@ -1,0 +1,4 @@
+# Pengecualian: domain di sini TETAP di-redirect walau berbau api.
+# Menang atas api-exclude.txt dan heuristik label "api".
+# Satu domain per baris. Suffix match: "example.com" juga mencakup sub-domain.
+# Contoh: api.x.com

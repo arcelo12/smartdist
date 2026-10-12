@@ -10,6 +10,7 @@ services:
     volumes:
       # Memasukkan file konfigurasi utama
       - ./dnsdist.conf:/etc/dnsdist/dnsdist.conf:ro
+      - ./dnsdist-tls.conf:/etc/dnsdist/dnsdist-tls.conf:ro
       # Memasukkan plugin wrapper
       - ./smartdns_plugin.lua:/etc/dnsdist/smartdns_plugin.lua:ro
       # Memasukkan folder list dari direktori lokal ./cdn-ips agar ikut di dalam folder proyek dnsdist

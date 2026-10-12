@@ -1,0 +1,6 @@
+# Domain yang TIDAK boleh di-redirect (tambahan manual).
+# Domain berlabel "api" (api.x.com, x.api.com, api-v2.x.com, x-api.com)
+# sudah otomatis di-exclude oleh heuristik; tidak perlu ditulis di sini.
+# File ini untuk domain non-api yang tetap harus di-skip.
+# Satu domain per baris, suffix match ("example.com" mencakup sub-domain).
+# Baris diawali "#" diabaikan.
