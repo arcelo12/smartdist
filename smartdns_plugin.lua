@@ -921,13 +921,15 @@ function smartdns_enable_speedcheck()
                 end
             end
 
-            if #ips < 2 then return DNSResponseAction.None, "" end
+            -- Domain dengan SATU IP tetap diagregasi: banyak domain (mis. facebook.com)
+            -- hanya memberi 1 A record per resolver, dan IP-nya berbeda antar resolver.
+            -- Tanpa ini, gabungan dari beberapa upstream tidak pernah terkumpul.
+            if #ips == 0 then return DNSResponseAction.None, "" end
 
             -- Masukkan ke antrian probe background
             _enqueue(domain, ips)
 
             -- Masukkan ke antrian parallel upstream juga
-            -- BUG FIX: gunakan _active_upstreams, bukan PARALLEL_UPSTREAMS manual
             if #_active_upstreams > 0 then
                 if #_parallel_queue < SPEEDCHECK_QUEUE_LIMIT and not _parallel_queue_set[domain] then
                     table.insert(_parallel_queue, domain)
