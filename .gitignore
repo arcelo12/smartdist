@@ -16,3 +16,6 @@ cf-node-test.sh
 cf-test-domains.txt
 private/
 smartdist-prober/
+dnsdist-web/
+dnsdist-monitoring/
+dnsdist-tls.conf
