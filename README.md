@@ -97,8 +97,8 @@ dofile("/etc/dnsdist/smartdns_plugin.lua")
 
 -- ... aturan ip-set, cname, ip-rules Anda di sini ...
 
-smartdns_ip_set("cloudflare-ipv4", "/etc/smartdist/cdn-ips/cloudflare/ipv4.txt")
-smartdns_domain_set("cf-exclude", "/etc/smartdist/cdn-ips/cloudflare/exclude.txt")
+smartdns_ip_set("cloudflare-ipv4", "/etc/dnsdist/cdn-ips/cloudflare/ipv4.txt")
+smartdns_domain_set("cf-exclude", "/etc/dnsdist/cdn-ips/cloudflare/exclude.txt")
 smartdns_cname("-.api.x.com", "api.x.com.cdn.cloudflare.net.")
 smartdns_ip_rules_alias("cloudflare-ipv4", {"172.64.52.159", "172.64.87.224"}, "cf-exclude")
 
@@ -116,8 +116,8 @@ SPEEDCHECK_QUEUE_LIMIT = 200        -- Maksimal antrian di latar belakang
 SPEEDCHECK_MAX_SOCKETS = 120        -- Batas keras socket TCP probe aktif bersamaan
 
 -- Pengecualian API (domain yang tidak di-redirect)
-smartdns_domain_set("api-exclude", "/etc/smartdist/cdn-ips/api-exclude.txt")
-smartdns_domain_set("api-allow", "/etc/smartdist/cdn-ips/api-allow.txt")
+smartdns_domain_set("api-exclude", "/etc/dnsdist/cdn-ips/api-exclude.txt")
+smartdns_domain_set("api-allow", "/etc/dnsdist/cdn-ips/api-allow.txt")
 EXCLUDE_DOMAIN_SET = "api-exclude"
 API_ALLOW_SET      = "api-allow"
 EXCLUDE_API_LIKE   = true  -- true = label "api" otomatis di-exclude
@@ -205,7 +205,7 @@ SmartDist mereplikasi fungsionalitas `speed-check-mode ping,tcp:80,tcp:443` dari
 Memuat daftar *range* IP ke dalam NetmaskGroup.
 
 ```lua
-smartdns_ip_set("cloudflare-ipv4", "/etc/smartdist/cdn-ips/cloudflare/ipv4.txt")
+smartdns_ip_set("cloudflare-ipv4", "/etc/dnsdist/cdn-ips/cloudflare/ipv4.txt")
 ```
 
 **Format file:** Satu CIDR per baris (misal `173.245.48.0/20`). Baris yang diawali dengan `#` akan diabaikan.
@@ -215,7 +215,7 @@ smartdns_ip_set("cloudflare-ipv4", "/etc/smartdist/cdn-ips/cloudflare/ipv4.txt")
 Memuat daftar domain ke dalam SuffixMatchNode.
 
 ```lua
-smartdns_domain_set("cf-exclude", "/etc/smartdist/cdn-ips/cloudflare/exclude.txt")
+smartdns_domain_set("cf-exclude", "/etc/dnsdist/cdn-ips/cloudflare/exclude.txt")
 ```
 
 **Format file:** Satu domain per baris. Awalan wildcard `*.` otomatis dihapus.

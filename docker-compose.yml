@@ -14,4 +14,4 @@ services:
       # Memasukkan plugin wrapper
       - ./smartdns_plugin.lua:/etc/dnsdist/smartdns_plugin.lua:ro
       # Memasukkan folder list dari direktori lokal ./cdn-ips agar ikut di dalam folder proyek dnsdist
-      - ./cdn-ips:/etc/smartdns/cdn-ips:ro
+      - ./cdn-ips:/etc/dnsdist/cdn-ips:ro

@@ -98,14 +98,14 @@ dofile("/etc/dnsdist/smartdns_plugin.lua")
 
 -- ... your ip-set, cname, ip-rules rules ...
 
-smartdns_ip_set("cloudflare-ipv4", "/etc/smartdist/cdn-ips/cloudflare/ipv4.txt")
-smartdns_domain_set("cf-exclude", "/etc/smartdist/cdn-ips/cloudflare/exclude.txt")
+smartdns_ip_set("cloudflare-ipv4", "/etc/dnsdist/cdn-ips/cloudflare/ipv4.txt")
+smartdns_domain_set("cf-exclude", "/etc/dnsdist/cdn-ips/cloudflare/exclude.txt")
 smartdns_cname("-.api.x.com", "api.x.com.cdn.cloudflare.net.")
 smartdns_ip_rules_alias("cloudflare-ipv4", {"172.64.52.159", "172.64.87.224"}, "cf-exclude")
 
 -- API exclusion (domains that are never redirected)
-smartdns_domain_set("api-exclude", "/etc/smartdist/cdn-ips/api-exclude.txt")
-smartdns_domain_set("api-allow", "/etc/smartdist/cdn-ips/api-allow.txt")
+smartdns_domain_set("api-exclude", "/etc/dnsdist/cdn-ips/api-exclude.txt")
+smartdns_domain_set("api-allow", "/etc/dnsdist/cdn-ips/api-allow.txt")
 EXCLUDE_DOMAIN_SET = "api-exclude"
 API_ALLOW_SET      = "api-allow"
 EXCLUDE_API_LIKE   = true  -- true = "api" label is excluded automatically
@@ -206,7 +206,7 @@ SmartDist replicates SmartDNS's `speed-check-mode ping,tcp:80,tcp:443` behavior:
 Load an IP range list into a named NetmaskGroup.
 
 ```lua
-smartdns_ip_set("cloudflare-ipv4", "/etc/smartdist/cdn-ips/cloudflare/ipv4.txt")
+smartdns_ip_set("cloudflare-ipv4", "/etc/dnsdist/cdn-ips/cloudflare/ipv4.txt")
 ```
 
 **File format:** One CIDR per line (e.g. `173.245.48.0/20`). Lines starting with `#` are ignored.
@@ -216,7 +216,7 @@ smartdns_ip_set("cloudflare-ipv4", "/etc/smartdist/cdn-ips/cloudflare/ipv4.txt")
 Load a domain list into a named SuffixMatchNode.
 
 ```lua
-smartdns_domain_set("cf-exclude", "/etc/smartdist/cdn-ips/cloudflare/exclude.txt")
+smartdns_domain_set("cf-exclude", "/etc/dnsdist/cdn-ips/cloudflare/exclude.txt")
 ```
 
 **File format:** One domain per line. Wildcard prefix `*.` is auto-stripped.
