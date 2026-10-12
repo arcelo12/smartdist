@@ -58,7 +58,7 @@ local _parallel_queue      = {}        -- Antrian domain yang perlu diresolve pa
 local _parallel_queue_set  = {}        -- Hash map O(1) untuk duplikat
 local _parallel_sockets    = {}        -- Socket UDP aktif untuk query DNS
 local _active_upstreams    = {}        -- List upstream aktif setelah filter latency
-local _last_upstream_refresh = 0       -- Timestamp refresh terakhir
+local _last_upstream_refresh = -1e18   -- -inf efektif: paksa refresh pertama di tick pertama
 
 if not _has_socket then
     warnlog("[SmartDist] lua-socket tidak ditemukan! Speed Check DINONAKTIFKAN.")
@@ -66,6 +66,60 @@ if not _has_socket then
     SPEEDCHECK_ENABLED = false
 else
     infolog("[SmartDist] lua-socket OK. Speed Check AKTIF untuk semua domain.")
+end
+
+-- ============================================================================
+-- REKAM ADDRESS newServer().
+-- PENTING: getName() mengembalikan NAME server, bukan IP. Memakai name untuk
+-- setpeername/connect memicu DNS lookup BLOCKING di main thread dnsdist
+-- (terukur ~4 detik per nama) dan membuat query macet. Kita bungkus
+-- newServer() untuk menangkap address asli.
+-- ============================================================================
+_ns_addr_by_name  = {}
+_ns_addr_by_index = {}
+do
+    local _origNewServer = newServer
+    if type(_origNewServer) == "function" then
+        newServer = function(...)
+            local a = ...
+            local addr, nm
+            if type(a) == "string" then
+                addr = a
+            elseif type(a) == "table" then
+                addr = a.address
+                nm = a.name
+            end
+            local r = _origNewServer(...)
+            if addr then
+                -- Buang bracket IPv6 dan port
+                local host = addr:match("^%[([^%]]+)%]") or addr:match("^([^:]+)")
+                if host then
+                    table.insert(_ns_addr_by_index, { name = nm or "", ip = host })
+                    if nm and nm ~= "" then _ns_addr_by_name[nm] = host end
+                end
+            end
+            return r
+        end
+    end
+end
+
+-- Resolusi IP server: name-map dulu, lalu positional (dengan validasi nama).
+local function _resolve_server_ip(s, idx)
+    local nm = s:getName()
+    if nm and nm ~= "" and _ns_addr_by_name[nm] then
+        return _ns_addr_by_name[nm]
+    end
+    local rec = _ns_addr_by_index[idx]
+    if rec and rec.name == (nm or "") then return rec.ip end
+    return nil
+end
+
+-- Hanya izinkan literal IP (IPv4/IPv6). Hostname akan memicu DNS blocking.
+local function _is_ip_literal(v)
+    if type(v) ~= "string" then return false end
+    if v:match("^%d+%.%d+%.%d+%.%d+$") then return true end
+    if v:find(":") and v:match("^[0-9a-fA-F:]+$") then return true end
+    return false
 end
 
 -- Helper: Generate Raw DNS A Query Packet (UDP)
@@ -162,21 +216,27 @@ function maintenance()
             local candidates = {}
             local ok, srvs = pcall(getServers)
             if ok and srvs then
-                for _, s in ipairs(srvs) do
+                for idx, s in ipairs(srvs) do
                     local lat = s:getLatency()
                     local up  = s:isUp()
-                    if up and lat > 0 and lat <= max_lat then
-                        local name = s:getName()
-                        -- Ekstrak IP saja (hilangkan port :53)
-                        local ip = name:match("^%[?([^%]%[]+)%]?:%d+$") or name:match("^([^:]+)")
-                        if ip then
+                    -- Terima server yang UP. Latency 0 = belum terukur (mis. saat warmup);
+                    -- jangan dibuang, hanya diurutkan ke belakang, agar agregasi tidak
+                    -- menunggu satu siklus refresh penuh.
+                    if up and lat <= max_lat then
+                        local ip = _resolve_server_ip(s, idx)
+                        if ip and _is_ip_literal(ip) then
                             table.insert(candidates, { ip = ip, lat = lat })
                         end
                     end
                 end
             end
-            -- Sort ascending by latency
-            table.sort(candidates, function(a, b) return a.lat < b.lat end)
+            -- Sort ascending by latency. lat==0 (belum terukur) dianggap paling lambat,
+            -- supaya server yang sudah terbukti cepat tetap diprioritaskan.
+            table.sort(candidates, function(a, b)
+                local la = (a.lat > 0) and a.lat or math.huge
+                local lb = (b.lat > 0) and b.lat or math.huge
+                return la < lb
+            end)
             -- Ambil hanya top N
             _active_upstreams = {}
             for i = 1, math.min(#candidates, max_up) do
@@ -186,6 +246,10 @@ function maintenance()
                 local names = table.concat(_active_upstreams, ", ")
                 infolog(string.format("[SmartDist] Parallel: %d upstream aktif (lat <=%.0fms): %s",
                     #_active_upstreams, max_lat, names))
+            else
+                -- Belum ada upstream UP (warmup awal / semua server down).
+                -- Paksa percobaan refresh di tick berikutnya, jangan tunggu siklus penuh.
+                _last_upstream_refresh = -1e18
             end
         end
     end
@@ -285,32 +349,33 @@ function maintenance()
     if #_active_upstreams > 0 then
         local still_parallel = {}
         for _, sess in ipairs(_parallel_sockets) do
-            if (now - sess.start_time) > 1 then
+            -- Baca dulu, baru cek timeout: data bisa tiba tepat di tick yang
+            -- sama ketika socket melewati batas umur. Menutup sebelum membaca
+            -- membuat balasan recursor hilang.
+            local data, err = sess.sock:receive()
+            if data then
+                pcall(function()
+                    local overlay = newDNSPacketOverlay(data)
+                    local count = overlay:getRecordsCountInSection(DNSSection.Answer)
+                    local ips = {}
+                    for i = 0, count - 1 do
+                        local rec = overlay:getRecord(i)
+                        if rec.type == DNSQType.A and rec.contentLength == 4 then
+                            local ip_str = string.format("%d.%d.%d.%d",
+                                data:byte(rec.contentOffset + 1), data:byte(rec.contentOffset + 2),
+                                data:byte(rec.contentOffset + 3), data:byte(rec.contentOffset + 4))
+                            ips[#ips + 1] = ip_str
+                        end
+                    end
+                    if #ips > 0 then
+                        _enqueue(sess.domain, ips)
+                    end
+                end)
+                pcall(function() sess.sock:close() end)
+            elseif (now - sess.start_time) > 2 then
                 pcall(function() sess.sock:close() end)
             else
-                local data, err = sess.sock:receive()
-                if data then
-                    pcall(function()
-                        local overlay = newDNSPacketOverlay(data)
-                        local count = overlay:getRecordsCountInSection(DNSSection.Answer)
-                        local ips = {}
-                        for i = 0, count - 1 do
-                            local rec = overlay:getRecord(i)
-                            if rec.type == DNSQType.A and rec.contentLength == 4 then
-                                local ip_str = string.format("%d.%d.%d.%d",
-                                    data:byte(rec.contentOffset + 1), data:byte(rec.contentOffset + 2),
-                                    data:byte(rec.contentOffset + 3), data:byte(rec.contentOffset + 4))
-                                ips[#ips + 1] = ip_str
-                            end
-                        end
-                        if #ips > 0 then
-                            _enqueue(sess.domain, ips)
-                        end
-                    end)
-                    pcall(function() sess.sock:close() end)
-                else
-                    still_parallel[#still_parallel + 1] = sess
-                end
+                still_parallel[#still_parallel + 1] = sess
             end
         end
         _parallel_sockets = still_parallel
@@ -322,20 +387,23 @@ function maintenance()
                 _parallel_queue_set[domain] = nil
                 local query_pkt = _build_dns_a_query(domain)
                 for _, upstream in ipairs(_active_upstreams) do
-                    local ok, sock = pcall(function()
-                        local s = _socket.udp()
-                        s:settimeout(0)
-                        s:setpeername(upstream, 53)
-                        s:send(query_pkt)
-                        return s
-                    end)
-                    if ok and sock then
-                        table.insert(_parallel_sockets, {
-                            sock = sock,
-                            domain = domain,
-                            upstream = upstream,
-                            start_time = now
-                        })
+                    -- SANITY: hanya literal IP. Hostname memicu DNS lookup blocking.
+                    if _is_ip_literal(upstream) then
+                        local ok, sock = pcall(function()
+                            local s = _socket.udp()
+                            s:settimeout(0)
+                            s:setpeername(upstream, 53)
+                            s:send(query_pkt)
+                            return s
+                        end)
+                        if ok and sock then
+                            table.insert(_parallel_sockets, {
+                                sock = sock,
+                                domain = domain,
+                                upstream = upstream,
+                                start_time = now
+                            })
+                        end
                     end
                 end
             end

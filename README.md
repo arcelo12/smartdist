@@ -194,9 +194,9 @@ SmartDist mereplikasi fungsionalitas `speed-check-mode ping,tcp:80,tcp:443` dari
 
 1. **Query Pertama** untuk `x.com` → DnsDist meneruskan query ke upstream dan langsung mengembalikan respons (tanpa jeda). Di latar belakang, SmartDist menjadwalkan domain ini untuk di-probe.
 2. **Pemilihan Upstream Cerdas** → Setiap 30 detik (dapat diatur), SmartDist memanggil `getServers()` untuk melihat semua `newServer()` Anda, mengukur latency saat ini, lalu otomatis memilih **Top N yang paling cepat** yang merespons di bawah batas `PARALLEL_UPSTREAM_MAX_LATENCY` ms. Upstream yang lambat atau *down* otomatis dilewati.
-3. **Query UDP Paralel** → SmartDist mengirim query DNS untuk domain tersebut ke Top N upstream tersebut secara bersamaan, mengumpulkan semua IP balasan menjadi satu *pool* kandidat.
-4. **TCP Probing di Latar Belakang** (`maintenance()`, berjalan tiap ~1 detik) → TCP connect *non-blocking* ke semua IP kandidat pada port 80 dan 443. IP pertama yang merespons sebanyak `SPEEDCHECK_MAX_RESPONSE` buah dicache sebagai "juara".
-5. **Query Berikutnya** untuk `x.com` → DnsDist menulis ulang respons. Mode `fastest-ip`: mengurutkan paket agar IP tercepat #1 di urutan teratas. Mode `fastest-response`: menimpa semua record dengan Top N IP tercepat secara *round-robin*.
+3. **Query UDP Paralel** → SmartDist mengirim query DNS untuk domain tersebut ke Top N upstream tersebut secara bersamaan. Kandidat IP dari semua upstream **digabung dan dideduplikasi** menjadi satu *pool*.
+4. **TCP Probing** (`maintenance()`, dipanggil dnsdist ~1 detik sekali) → untuk tiap domain, semua IP kandidat diuji koneksi TCP (port 80/443) sekaligus dalam satu tick memakai `socket.select()` dengan jendela `SPEEDCHECK_PROBE_WINDOW_MS` (default 50ms). IP yang terkoneksi paling awal dianggap tercepat. Hingga `SPEEDCHECK_MAX_RESPONSE` IP dicache sebagai "juara". *(Uji di dnsdist 2.0.7: `maintenance()` dipanggil ~1x/detik, jadi pengukuran harus selesai dalam tick yang sama.)*
+5. **Query Berikutnya** untuk `x.com` → DnsDist menulis ulang respons dari cache. Mode `fastest-ip`: IP tercepat dinaikkan ke urutan teratas **dan** IP hasil agregasi dari recursor lain yang belum ada di jawaban **ditambahkan** sebagai record baru (hingga `SPEEDCHECK_MAX_RESPONSE`), sehingga jawaban memuat kandidat gabungan dari semua upstream. Mode `fastest-response`: menimpa semua record dengan Top N IP tercepat secara *round-robin*.
 
 ## 🔌 Referensi API Plugin
 

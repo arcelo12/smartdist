@@ -195,9 +195,9 @@ SmartDist replicates SmartDNS's `speed-check-mode ping,tcp:80,tcp:443` behavior:
 
 1. **First query** for `x.com` → DnsDist forwards the query to an upstream and returns the response immediately (no stalling). In the background, SmartDist schedules the domain for probing.
 2. **Smart Upstream Selection** → Every 30s (configurable), SmartDist calls `getServers()` to get all `newServer()` entries, measures their current latency, and auto-selects the **top N fastest** that respond within `PARALLEL_UPSTREAM_MAX_LATENCY` ms. Slow or down servers are skipped.
-3. **Parallel UDP Queries** → SmartDist sends DNS queries for the domain to those top N upstreams simultaneously, aggregating all returned IPs into one candidate pool.
-4. **Background TCP Probing** (`maintenance()`, runs every ~1s) → Non-blocking TCP connects to all candidate IPs on ports 80 and 443. The first `SPEEDCHECK_MAX_RESPONSE` IPs to respond are cached as winners.
-5. **Next query** for `x.com` → DnsDist rewrites the response. In `fastest-ip` mode: reorder the packet so the fastest IP is first. In `fastest-response` mode: overwrite all records with the top N fastest IPs (round-robin).
+3. **Parallel UDP Queries** → SmartDist sends DNS queries for the domain to those top N upstreams simultaneously. Candidate IPs from all upstreams are **merged and de-duplicated** into one pool.
+4. **TCP Probing** (`maintenance()`, called ~1x/second by dnsdist) → for each domain, all candidate IPs are TCP-tested (ports 80/443) together within a single tick using `socket.select()` with a `SPEEDCHECK_PROBE_WINDOW_MS` window (default 50ms). The earliest connected IP wins. Up to `SPEEDCHECK_MAX_RESPONSE` IPs are cached as winners. *(Verified on dnsdist 2.0.7: `maintenance()` runs ~1x/second, so measurement must complete within the same tick.)*
+5. **Next query** for `x.com` → DnsDist rewrites the response from cache. In `fastest-ip` mode: the fastest IP is moved to the top **and** aggregated IPs from other recursors not already present are **appended** as new records (up to `SPEEDCHECK_MAX_RESPONSE`), so the answer carries the combined candidate set from all upstreams. In `fastest-response` mode: overwrite all records with the top N fastest IPs (round-robin).
 
 ## 🔌 Plugin API Reference
 
