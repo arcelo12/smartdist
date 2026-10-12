@@ -113,7 +113,7 @@ SPEEDCHECK_MAX_IPS     = 6          -- Maksimal IP yang dites per domain
 SPEEDCHECK_MAX_RESPONSE= 2          -- Maksimal jumlah IP yang dikembalikan oleh fastest-response
 SPEEDCHECK_CACHE_TTL   = 300        -- Berapa detik menyimpan IP tercepat di memori
 SPEEDCHECK_QUEUE_LIMIT = 200        -- Maksimal antrian di latar belakang
-SPEEDCHECK_MAX_SOCKETS = 120        -- Batas keras socket TCP probe aktif bersamaan
+SPEEDCHECK_PROBE_WINDOW_MS = 50     -- Jendela ukur TCP per domain per tick (ms)
 
 -- Pengecualian API (domain yang tidak di-redirect)
 smartdns_domain_set("api-exclude", "/etc/dnsdist/cdn-ips/api-exclude.txt")
@@ -264,7 +264,7 @@ Atur variabel-variabel ini di `dnsdist.conf`, setelah semua *rules*, sebelum mem
 | `SPEEDCHECK_MAX_RESPONSE`| `2` | Batas IP Juara yang dikembalikan oleh fastest-response |
 | `SPEEDCHECK_CACHE_TTL` | `300` | Lama detik menyimpan hasil di memori |
 | `SPEEDCHECK_QUEUE_LIMIT` | `200` | Kapasitas maksimal antrian *background probing* |
-| `SPEEDCHECK_MAX_SOCKETS` | `120` | Batas keras socket TCP probe aktif bersamaan |
+| `SPEEDCHECK_PROBE_WINDOW_MS` | `50` | Jendela ukur TCP per domain per tick (ms). `maintenance()` dipanggil ~1x/detik, jadi pengukuran selesai dalam satu tick |
 
 #### Variabel Parallel Upstream Aggregation
 

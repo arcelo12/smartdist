@@ -20,11 +20,9 @@ local _has_socket, _socket = pcall(require, "socket")
 local _speed_cache = {}
 
 -- Antrian probing: { { domain, ips[], timestamp } }
-local _probe_queue = {}
-local _probe_queue_set = {} -- O(1) lookup
-
--- Sesi socket aktif (non-blocking): { { sock, ip, domain, start_time } }
-local _active_sockets = {}
+local _probe_queue      = {}
+local _probe_queue_set  = {} -- O(1) lookup
+local _probe_pending    = {} -- domain -> daftar IP kandidat yang menunggu digabung
 
 -- Domain yang sudah di-rewrite oleh ip_rules_alias.
 local _aliased_domains = {}
@@ -42,7 +40,7 @@ SPEEDCHECK_MAX_IPS     = 6          -- Maks IP yang dites per domain
 SPEEDCHECK_MAX_RESPONSE= 2          -- Maksimal jumlah IP Juara yang dikembalikan (digunakan oleh fastest-response)
 SPEEDCHECK_CACHE_TTL   = 300        -- Detik menyimpan hasil di memori
 SPEEDCHECK_QUEUE_LIMIT = 200        -- Maks antrian domain sekaligus
-SPEEDCHECK_MAX_SOCKETS = 120        -- BUG FIX #3: Batas maksimal socket TCP aktif (6 IP x 2 port x 10 domain)
+SPEEDCHECK_PROBE_WINDOW_MS = 50     -- Jendela ukur TCP per domain per tick (ms). maintenance() dipanggil ~1x/detik.
 SPEEDCHECK_MAX_MEMORY_MB= 50        -- Batas maksimal RAM (Megabyte) untuk plugin Lua sebelum membuang cache lama
 
 -- Konfigurasi Parallel Upstream Aggregation
@@ -101,21 +99,35 @@ local function _get_fastest(domain)
     return nil
 end
 
--- Tambahkan domain ke antrian probing jika belum ada
+-- Tambahkan domain ke antrian probing. Jika domain SUDAH menunggu, IP baru
+-- digabungkan ke kandidat yang ada (hasil dari beberapa recursor sekaligus).
 local function _enqueue(domain, ips)
     if not SPEEDCHECK_ENABLED then return end
+
+    -- Merge: gabungkan kandidat dari semua recursor, dedup, batasi jumlah.
+    local pend = _probe_pending[domain]
+    if pend then
+        for _, ip in ipairs(ips) do
+            if #pend >= SPEEDCHECK_MAX_IPS then break end
+            local dup = false
+            for _, e in ipairs(pend) do
+                if e == ip then dup = true break end
+            end
+            if not dup then pend[#pend + 1] = ip end
+        end
+        return
+    end
+
     if #_probe_queue >= SPEEDCHECK_QUEUE_LIMIT then return end
-    
-    -- Cek duplikat O(1)
-    if _probe_queue_set[domain] then return end
 
     -- Batasi jumlah IP
     local limited = {}
     for i = 1, math.min(#ips, SPEEDCHECK_MAX_IPS) do
         limited[i] = ips[i]
     end
-    
-    table.insert(_probe_queue, { domain = domain, ips = limited })
+
+    _probe_pending[domain] = limited
+    table.insert(_probe_queue, { domain = domain })
     _probe_queue_set[domain] = true
 end
 
@@ -181,97 +193,90 @@ function maintenance()
     -- Cek budget sebelum mulai [1] yang berat
     if over_budget() then return end
 
-    -- [1] Periksa socket aktif: siapa yang sudah konek?
-    -- Poll maksimal 40 socket per tick untuk menjaga budget waktu
-    local still_active = {}
-    local polled = 0
-    local max_poll = math.min(40, #_active_sockets)
-    for idx, sess in ipairs(_active_sockets) do
-        if polled >= max_poll then
-            -- Sisa socket ditunda ke tick berikutnya
-            still_active[#still_active + 1] = sess
-        elseif (now - sess.start_time) > timeout_sec then
-            -- Timeout: buang
-            pcall(function() sess.sock:close() end)
-            polled = polled + 1
-        else
-            local res, err = sess.sock:connect(sess.ip, sess.port)
-            -- luasocket mengembalikan 1 saat koneksi non-blocking berhasil
-            if res == 1 or (not err) or err == "already connected" then
-                -- MENANG! IP ini cepat! Masukkan ke array IP pemenang.
-                local latency_ms = math.floor((now - sess.start_time) * 1000)
-                local entry = _speed_cache[sess.domain]
-                if not entry then
-                    -- CEK HARD LIMIT MEMORY (Berdasarkan RAM sesungguhnya)
-                    -- collectgarbage("count") mengembalikan ukuran RAM Lua dalam Kilobyte
-                    if (collectgarbage("count") / 1024) > (SPEEDCHECK_MAX_MEMORY_MB or 50) then
-                        -- Eviction: buang 1 elemen pseudo-acak dari memori untuk memberi ruang
-                        local k, _ = next(_speed_cache)
-                        if k then _speed_cache[k] = nil end
-                    end
-                    
-                    entry = { ips = {}, expires_at = now + SPEEDCHECK_CACHE_TTL }
-                    _speed_cache[sess.domain] = entry
-                end
-                
-                local is_dup = false
-                for _, existing_ip in ipairs(entry.ips) do
-                    if existing_ip == sess.ip then is_dup = true break end
-                end
-                
-                if not is_dup and #entry.ips < (SPEEDCHECK_MAX_RESPONSE or 2) then
-                    table.insert(entry.ips, sess.ip)
-                    infolog(string.format("[SmartDist] Fastest Rank #%d for %s -> %s (%dms)",
-                        #entry.ips, sess.domain, sess.ip, latency_ms))
-                    -- PERHATIAN: DnsDist expungeByName() TIDAK BOLEH digunakan di sini.
-                    -- expungeByName melakukan iterasi (O(N)) ke SEMUA isi cache. 
-                    -- Jika cache ada jutaan, ini akan membuat DnsDist FREEZE selama 
-                    -- beberapa detik sehingga SEMUA health check ping akan timeout serentak!
-                end
-                pcall(function() sess.sock:close() end)
-            else
-                -- Masih menunggu (TIMEOUT atau belum selesai)
-                still_active[#still_active + 1] = sess
+    -- [1] TCP PROBE (selesai dalam satu tick)
+    -- PENTING: dnsdist memanggil maintenance() hanya ~1x per detik, sehingga
+    -- socket non-blocking lintas-tick SELALU dibuang sebagai timeout sebelum
+    -- sempat di-poll. Pengukuran harus selesai dalam tick ini, memakai
+    -- socket.select() dengan slice 1ms. Kandidat yang terkoneksi lebih dulu
+    -- dianggap lebih cepat.
+    local probe_window = math.min(timeout_sec, (SPEEDCHECK_PROBE_WINDOW_MS or 50) / 1000)
+    local probed_domains = 0
+    while #_probe_queue > 0 and probed_domains < 2 and not over_budget() do
+        probed_domains = probed_domains + 1
+        local item = table.remove(_probe_queue, 1)
+        _probe_queue_set[item.domain] = nil
+        local ips = _probe_pending[item.domain] or {}
+        _probe_pending[item.domain] = nil
+
+        -- Buka socket untuk semua kandidat IP:port sekaligus
+        local probe_start = _now()
+        local pending = {}
+        for _, ip in ipairs(ips) do
+            for _, port in ipairs(SPEEDCHECK_PORTS) do
+                pcall(function()
+                    local s = _socket.tcp()
+                    s:settimeout(0)
+                    s:connect(ip, port)
+                    pending[#pending + 1] = { sock = s, ip = ip }
+                end)
             end
-            polled = polled + 1
         end
-    end
-    _active_sockets = still_active
 
-    -- Cek budget sebelum buka socket baru
-    if over_budget() then return end
+        -- Tunggu koneksi selesai: slice 1ms, dibatasi probe_window
+        local wait_until = probe_start + probe_window
+        while #pending > 0 and _now() < wait_until do
+            local wset = {}
+            for i = 1, #pending do wset[i] = pending[i].sock end
+            local ok_sel, _, writable = pcall(_socket.select, nil, wset, 0.001)
+            if ok_sel and writable then
+                for _, sready in ipairs(writable) do
+                    for i = #pending, 1, -1 do
+                        local p = pending[i]
+                        if p.sock == sready then
+                            -- getpeername() memastikan ini koneksi sukses,
+                            -- bukan writable karena koneksi ditolak.
+                            local ok_peer, peer = pcall(function() return p.sock:getpeername() end)
+                            if ok_peer and peer then
+                                local latency_ms = math.floor((_now() - probe_start) * 1000)
+                                local entry = _speed_cache[item.domain]
+                                if not entry then
+                                    -- CEK HARD LIMIT MEMORY (Berdasarkan RAM sesungguhnya)
+                                    -- collectgarbage("count") mengembalikan ukuran RAM Lua dalam Kilobyte
+                                    if (collectgarbage("count") / 1024) > (SPEEDCHECK_MAX_MEMORY_MB or 50) then
+                                        -- Eviction: buang 1 elemen pseudo-acak dari memori untuk memberi ruang
+                                        local k, _ = next(_speed_cache)
+                                        if k then _speed_cache[k] = nil end
+                                    end
+                                    entry = { ips = {}, expires_at = _now() + SPEEDCHECK_CACHE_TTL }
+                                    _speed_cache[item.domain] = entry
+                                end
 
-    -- [2] DRAIN BATCH: Ambil item dari antrian, buka socket jika masih ada slot
-    -- Max 2 domain per tick untuk menjaga budget waktu
-    if #_active_sockets < (SPEEDCHECK_MAX_SOCKETS or 120) then
-        local drain_count = math.min(2, #_probe_queue)
-        for i = 1, drain_count do
-            if over_budget() then break end
-            local item = table.remove(_probe_queue, 1)
-            if item then
-                for _, ip in ipairs(item.ips) do
-                    for _, port in ipairs(SPEEDCHECK_PORTS) do
-                        local ok, sock = pcall(function()
-                            local s = _socket.tcp()
-                            s:settimeout(0)
-                            s:connect(ip, port)
-                            return s
-                        end)
-                        if ok and sock then
-                            table.insert(_active_sockets, {
-                                sock = sock,
-                                ip = ip,
-                                port = port,
-                                domain = item.domain,
-                                start_time = now
-                            })
+                                local is_dup = false
+                                for _, existing_ip in ipairs(entry.ips) do
+                                    if existing_ip == p.ip then is_dup = true break end
+                                end
+
+                                if not is_dup and #entry.ips < (SPEEDCHECK_MAX_RESPONSE or 2) then
+                                    table.insert(entry.ips, p.ip)
+                                    infolog(string.format("[SmartDist] Fastest Rank #%d for %s -> %s (%dms)",
+                                        #entry.ips, item.domain, p.ip, latency_ms))
+                                    -- PERHATIAN: DnsDist expungeByName() TIDAK BOLEH digunakan di sini.
+                                    -- expungeByName melakukan iterasi (O(N)) ke SEMUA isi cache.
+                                    -- Jika cache ada jutaan, ini akan membuat DnsDist FREEZE selama
+                                    -- beberapa detik sehingga SEMUA health check ping akan timeout serentak!
+                                end
+                            end
+                            pcall(function() p.sock:close() end)
+                            table.remove(pending, i)
                         end
                     end
                 end
-                -- BUG FIX #2: Hapus dari set SETELAH semua socket domain ini dibuka
-                _probe_queue_set[item.domain] = nil
             end
+        end
 
+        -- Sisa yang tidak terkoneksi dalam window: tutup
+        for _, p in ipairs(pending) do
+            pcall(function() p.sock:close() end)
         end
     end
 
@@ -404,6 +409,87 @@ function _bytes_to_ipv6(pkt, offset)
         groups[#groups + 1] = string.format("%x", val)
     end
     return table.concat(groups, ":")
+end
+
+-- ============================================================================
+-- HELPER: Sisipkan record A/AAAA agregasi sesudah section Answer.
+-- Aman hanya jika: NSCOUNT==0, Additional kosong/hanya OPT (type 41),
+-- dan Answer tidak memuat CNAME/DNAME (owner record bukan lagi qname).
+-- Di luar kondisi itu, mengembalikan nil supaya paket tidak rusak.
+-- Mengembalikan pkt_bytes baru, atau nil.
+-- ============================================================================
+function _smartdns_append_answer_records(pkt, pkt_bytes, qtype, record_len, ips, max_add)
+    local ok, overlay = pcall(newDNSPacketOverlay, pkt)
+    if not ok or overlay == nil then return nil end
+    local an_count = overlay:getRecordsCountInSection(DNSSection.Answer)
+    if an_count == 0 then return nil end
+
+    -- Header counts (1-based): ANCOUNT 7-8, NSCOUNT 9-10, ARCOUNT 11-12
+    local nscount = pkt:byte(9) * 256 + pkt:byte(10)
+    if nscount ~= 0 then return nil end
+    local arcount = pkt:byte(11) * 256 + pkt:byte(12)
+
+    -- Additional hanya boleh OPT
+    for i = an_count, an_count + arcount - 1 do
+        local rec = overlay:getRecord(i)
+        if rec == nil or rec.type ~= 41 then return nil end
+    end
+
+    local present = {}
+    local end_ans = 12
+    for i = 0, an_count - 1 do
+        local rec = overlay:getRecord(i)
+        if rec.type == 5 or rec.type == 39 then return nil end -- CNAME/DNAME
+        local e = rec.contentOffset + rec.contentLength
+        if e > end_ans then end_ans = e end
+        if rec.type == qtype and rec.contentLength == record_len then
+            local key
+            if qtype == DNSQType.AAAA then
+                key = _bytes_to_ipv6(pkt, rec.contentOffset)
+            else
+                key = string.format("%d.%d.%d.%d",
+                    pkt:byte(rec.contentOffset + 1), pkt:byte(rec.contentOffset + 2),
+                    pkt:byte(rec.contentOffset + 3), pkt:byte(rec.contentOffset + 4))
+            end
+            if key then present[key] = true end
+        end
+    end
+
+    local extra = {}
+    local added = 0
+    for _, fip in ipairs(ips) do
+        if added >= (max_add or 2) then break end
+        if not present[fip] then
+            local tb = {}
+            if qtype == DNSQType.AAAA then
+                tb = _ipv6_to_bytes(fip)
+            else
+                for octet in fip:gmatch("%d+") do tb[#tb + 1] = tonumber(octet) end
+            end
+            if #tb == record_len then
+                -- name ptr(2) type(2) class(2) ttl(4) rdlength(2) rdata(len)
+                local rec_bytes = {0xC0, 0x0C, 0x00, qtype, 0x00, 0x01,
+                                   0x00, 0x00, 0x00, 0x3C, 0x00, record_len}
+                for b = 1, record_len do rec_bytes[#rec_bytes + 1] = tb[b] end
+                for b = 1, #rec_bytes do extra[#extra + 1] = rec_bytes[b] end
+                present[fip] = true
+                added = added + 1
+            end
+        end
+    end
+
+    if added == 0 then return nil end
+
+    local out = {}
+    for i = 1, end_ans do out[i] = pkt_bytes[i] end
+    for i = 1, #extra do out[end_ans + i] = extra[i] end
+    for i = end_ans + 1, #pkt_bytes do out[#out + 1] = pkt_bytes[i] end
+
+    local ancount = out[7] * 256 + out[8] + added
+    out[7] = math.floor(ancount / 256)
+    out[8] = ancount % 256
+
+    return out
 end
 
 -- ============================================================================
@@ -876,6 +962,14 @@ function smartdns_enable_speedcheck()
                         if fip_index > #target_bytes_list then fip_index = 1 end
                     end
                 end
+            end
+
+            -- GABUNGKAN IP agregasi dari beberapa recursor (mode fastest-ip):
+            -- sisipkan record A/AAAA baru dari cache speed check.
+            if SPEEDCHECK_MODE == "fastest-ip" then
+                local merged = _smartdns_append_answer_records(
+                    pkt, pkt_bytes, dr.qtype, record_len, fastest_ips, SPEEDCHECK_MAX_RESPONSE)
+                if merged then pkt_bytes = merged end
             end
 
             local parts = {}

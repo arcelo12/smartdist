@@ -121,7 +121,7 @@ SPEEDCHECK_MAX_IPS     = 6          -- Maks IP yang dites per domain
 SPEEDCHECK_MAX_RESPONSE= 2          -- Maks IP yang dikembalikan oleh fastest-response
 SPEEDCHECK_CACHE_TTL   = 300        -- Detik cache hasil tercepat
 SPEEDCHECK_QUEUE_LIMIT = 200        -- Maks antrian background
-SPEEDCHECK_MAX_SOCKETS = 120        -- Maks socket TCP probe aktif bersamaan
+SPEEDCHECK_PROBE_WINDOW_MS = 50     -- TCP measurement window per domain per tick (ms)
 
 -- Parallel Upstream Aggregation (auto-select from newServer() by latency)
 -- Kosong = otomatis pilih dari newServer() yang paling cepat
@@ -265,7 +265,7 @@ Set these in `dnsdist.conf` after all rules, before calling `smartdns_enable_spe
 | `SPEEDCHECK_MAX_RESPONSE`| `2` | Max winning IPs to return (`fastest-response` mode) |
 | `SPEEDCHECK_CACHE_TTL` | `300` | Seconds to cache fastest IP result |
 | `SPEEDCHECK_QUEUE_LIMIT` | `200` | Max concurrent probe queue size |
-| `SPEEDCHECK_MAX_SOCKETS` | `120` | Hard cap on active TCP probe sockets |
+| `SPEEDCHECK_PROBE_WINDOW_MS` | `50` | TCP measurement window per domain per tick (ms). `maintenance()` runs ~1x/second, so measurement completes within one tick |
 
 #### Parallel Upstream Aggregation
 
