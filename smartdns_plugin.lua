@@ -514,6 +514,33 @@ function smartdns_cname(domain_pattern, target_cname)
 end
 
 -- ============================================================================
+-- Meniru fungsi: address /domain/ip  (override) dan address /domain/#  (NXDOMAIN)
+-- Dipasang sebagai SuffixMatchNodeRule: domain + seluruh sub-domain.
+-- ip = "#" -> NXDOMAIN. Pola exclude API tidak berlaku (ini perintah eksplisit).
+-- ============================================================================
+function smartdns_address(domain_pattern, ip)
+    local clean = domain_pattern:gsub("^%-%.", ""):gsub("^%.", ""):gsub("^%*%.", "")
+    local suffix = SuffixMatchNodeRule(clean)
+    if ip == "#" then
+        addAction(suffix, RCodeAction(DNSRCode.NXDOMAIN))
+    else
+        local qtype = ip:find(":") and DNSQType.AAAA or DNSQType.A
+        addAction(AndRule({suffix, QTypeRule(qtype)}), SpoofAction(ip))
+    end
+    infolog("smartdns: address /" .. clean .. "/" .. ip)
+end
+
+-- ============================================================================
+-- Meniru fungsi: nameserver /domain/group  (routing domain ke upstream tertentu)
+-- group = nama pool dari newPoolAction / newServer({pool="..."}) di dnsdist.conf.
+-- ============================================================================
+function smartdns_nameserver(domain_pattern, pool_name)
+    local clean = domain_pattern:gsub("^%-%.", ""):gsub("^%.", ""):gsub("^%*%.", "")
+    addAction(SuffixMatchNodeRule(clean), PoolAction(pool_name))
+    infolog("smartdns: nameserver /" .. clean .. "/ -> pool " .. pool_name)
+end
+
+-- ============================================================================
 -- Meniru fungsi: ip-rules ip-set:[ip_set] -ip-alias [target_ip(s)]
 --
 -- target_ips bisa berupa:
