@@ -11,6 +11,7 @@
 - **Multiple Target IPs** — Mendukung *round-robin* untuk banyak IP target
 - **IPv4 & IPv6** — Deteksi dan penanganan otomatis untuk record A maupun AAAA
 - **Pengecualian Domain** — Melewati proses aliasing untuk domain tertentu menggunakan *domain-set*
+- **Pengecualian API Otomatis** — Domain berlabel `api` (`api.x.com`, `x.api.com`, `api-v2.x.com`, `x-api.com`, `api2.x.com`) tidak di-redirect (CNAME, ip-alias, dan speed-check). Ada *allow list* untuk kasus yang tetap ingin dipercepat
 - **Wildcard CNAME** — Manipulasi (spoof) CNAME untuk pola domain wildcard
 - **🆕 Async Speed Check** — Secara otomatis mencari IP paling cepat untuk **setiap domain** menggunakan *background TCP probing* (meniru perilaku `speed-check-mode ping,tcp:80,tcp:443` di SmartDNS)
 - **Graceful Degradation** — Speed Check akan mati secara diam-diam jika `lua-socket` tidak terpasang; fitur utama lainnya akan tetap berjalan
@@ -24,11 +25,15 @@ SmartDist/
 ├── smartdns_plugin.lua     # Plugin: Lapisan kompatibilitas SmartDNS + Speed Check
 ├── docker-compose.yml      # Deployment Docker
 └── cdn-ips/                # Daftar IP & domain
+    ├── api-exclude.txt     # Domain tambahan yang TIDAK di-redirect
+    ├── api-allow.txt       # Domain berbau api yang TETAP di-redirect
     └── cloudflare/
         ├── ipv4.txt        # Range IPv4 Cloudflare
         ├── ipv6.txt        # Range IPv6 Cloudflare
         └── exclude.txt     # Domain yang dikecualikan dari aliasing
 ```
+
+> `dnsdist-web/`, `dnsdist-monitoring/`, dan `dnsdist-tls.conf` adalah artefak lokal (berisi kredensial/data runtime) dan sengaja tidak masuk repo.
 
 ## 🏗 Arsitektur & Topologi (Sifat Asli SmartDNS)
 
@@ -110,6 +115,13 @@ SPEEDCHECK_CACHE_TTL   = 300        -- Berapa detik menyimpan IP tercepat di mem
 SPEEDCHECK_QUEUE_LIMIT = 200        -- Maksimal antrian di latar belakang
 SPEEDCHECK_MAX_SOCKETS = 120        -- Batas keras socket TCP probe aktif bersamaan
 
+-- Pengecualian API (domain yang tidak di-redirect)
+smartdns_domain_set("api-exclude", "/etc/smartdist/cdn-ips/api-exclude.txt")
+smartdns_domain_set("api-allow", "/etc/smartdist/cdn-ips/api-allow.txt")
+EXCLUDE_DOMAIN_SET = "api-exclude"
+API_ALLOW_SET      = "api-allow"
+EXCLUDE_API_LIKE   = true  -- true = label "api" otomatis di-exclude
+
 -- Parallel Upstream Aggregation (auto-pilih dari newServer() berdasarkan latency)
 -- Kosong = otomatis, akan memilih sendiri dari newServer() yang paling cepat
 PARALLEL_UPSTREAMS            = {}   -- Override manual: {"8.8.8.8", "1.1.1.1"}
@@ -126,6 +138,44 @@ smartdns_enable_speedcheck()
 ```bash
 nslookup cloudflare.com <ip-server-anda>
 dig youtube.com @<ip-server-anda>
+```
+
+## 🚫 Pengecualian API
+
+Beberapa API tidak boleh di-redirect ke IP lain (sertifikat, token, atau pinning). Daripada mendaftar satu per satu, domain berbau `api` dikecualikan otomatis.
+
+**Urutan prioritas:**
+
+1. `api-allow.txt` — dipercepat/di-redirect walau berbau api (menang atas semua).
+2. `api-exclude.txt` — daftar manual, tidak di-redirect.
+3. Heuristik label `api` (aktif jika `EXCLUDE_API_LIKE = true`).
+
+**Pola yang dikenali heuristik** (per label, case-insensitive):
+
+| Contoh | Cocok |
+|---|---|
+| `api.x.com`, `x.api.com` | ya (label `api`) |
+| `api-v2.x.com`, `x-api.com` | ya (`api-` / `-api`) |
+| `api2.x.com` | ya (`api` + angka) |
+| `apix.com`, `rapid.com` | tidak |
+
+**Berlaku di:** CNAME rewrite (`smartdns_cname`), penulisan IP (`smartdns_ip_rules_alias`), dan speed-check.
+
+**Cara pakai:**
+
+```
+# cdn-ips/api-allow.txt  — tetap di-redirect
+api.x.com
+
+# cdn-ips/api-exclude.txt — tidak di-redirect (tambahan manual)
+bank.example.co.id
+```
+
+**Audit log** (dnsdist container):
+
+```bash
+docker logs <container> 2>&1 | grep "excluded from redirect"   # yang di-skip
+docker logs <container> 2>&1 | grep "rewrite applied"           # yang di-redirect
 ```
 
 ## ⚡ Fitur Speed Check

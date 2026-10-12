@@ -11,6 +11,7 @@
 - **Multiple target IPs** — Round-robin support for multiple alias targets
 - **IPv4 & IPv6** — Automatic detection and handling of both A and AAAA records
 - **Domain exclusion** — Skip aliasing for specific domains via domain-set
+- **Automatic API exclusion** — Domains with an `api` label (`api.x.com`, `x.api.com`, `api-v2.x.com`, `x-api.com`, `api2.x.com`) are never redirected (CNAME, ip-alias, speed-check). An allow list keeps selected ones redirected
 - **Wildcard CNAME** — Spoof CNAME for wildcard domain patterns
 - **🆕 Async Speed Check** — Automatically finds the fastest IP for **every domain** using background TCP probing (mimics SmartDNS `speed-check-mode ping,tcp:80,tcp:443`)
 - **Graceful Degradation** — Speed Check silently disables itself if `lua-socket` is not installed; core features still work
@@ -24,11 +25,15 @@ SmartDist/
 ├── smartdns_plugin.lua     # Plugin: SmartDNS compatibility layer + Speed Check
 ├── docker-compose.yml      # Docker deployment
 └── cdn-ips/                # IP & domain lists
+    ├── api-exclude.txt     # Extra domains that are NEVER redirected
+    ├── api-allow.txt       # api-like domains that stay redirected
     └── cloudflare/
         ├── ipv4.txt        # Cloudflare IPv4 ranges
         ├── ipv6.txt        # Cloudflare IPv6 ranges
         └── exclude.txt     # Domains to exclude from aliasing
 ```
+
+> `dnsdist-web/`, `dnsdist-monitoring/`, and `dnsdist-tls.conf` are local artifacts (they hold credentials and runtime data) and are intentionally not in the repo.
 
 ## 🏗 Architecture & Topology (The SmartDNS Behavior)
 
@@ -98,6 +103,13 @@ smartdns_domain_set("cf-exclude", "/etc/smartdist/cdn-ips/cloudflare/exclude.txt
 smartdns_cname("-.api.x.com", "api.x.com.cdn.cloudflare.net.")
 smartdns_ip_rules_alias("cloudflare-ipv4", {"172.64.52.159", "172.64.87.224"}, "cf-exclude")
 
+-- API exclusion (domains that are never redirected)
+smartdns_domain_set("api-exclude", "/etc/smartdist/cdn-ips/api-exclude.txt")
+smartdns_domain_set("api-allow", "/etc/smartdist/cdn-ips/api-allow.txt")
+EXCLUDE_DOMAIN_SET = "api-exclude"
+API_ALLOW_SET      = "api-allow"
+EXCLUDE_API_LIKE   = true  -- true = "api" label is excluded automatically
+
 newServer("8.8.8.8")
 newServer("1.1.1.1")
 
@@ -127,6 +139,44 @@ smartdns_enable_speedcheck()
 ```bash
 nslookup cloudflare.com <your-server-ip>
 dig youtube.com @<your-server-ip>
+```
+
+## 🚫 API Exclusion
+
+Some APIs must not be redirected to another IP (certificates, tokens, pinning). Instead of listing each one, domains with an `api` label are excluded automatically.
+
+**Priority order:**
+
+1. `api-allow.txt` — stays redirected/accelerated even if api-like (wins over everything).
+2. `api-exclude.txt` — manual list, never redirected.
+3. `api` label heuristic (active when `EXCLUDE_API_LIKE = true`).
+
+**Patterns the heuristic matches** (per label, case-insensitive):
+
+| Example | Match |
+|---|---|
+| `api.x.com`, `x.api.com` | yes (`api` label) |
+| `api-v2.x.com`, `x-api.com` | yes (`api-` / `-api`) |
+| `api2.x.com` | yes (`api` + digits) |
+| `apix.com`, `rapid.com` | no |
+
+**Applies to:** CNAME rewrite (`smartdns_cname`), IP rewrite (`smartdns_ip_rules_alias`), and speed check.
+
+**Usage:**
+
+```
+# cdn-ips/api-allow.txt  — keep redirected
+api.x.com
+
+# cdn-ips/api-exclude.txt — never redirected (manual extras)
+bank.example.co.id
+```
+
+**Audit log** (dnsdist container):
+
+```bash
+docker logs <container> 2>&1 | grep "excluded from redirect"   # skipped
+docker logs <container> 2>&1 | grep "rewrite applied"           # redirected
 ```
 
 ## ⚡ Speed Check Feature
